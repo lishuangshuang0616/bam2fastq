@@ -1,6 +1,7 @@
 use std::backtrace;
 use std::io::{BufWriter, Write};
 use std::{borrow::Cow, collections::HashMap, path::PathBuf, str::FromStr};
+use rpcache::RpCache;
 use serde::{Serialize, Deserialize};
 use shardio::helper::ThreadProxyWriter;
 use shardio::SortKey;
@@ -18,7 +19,9 @@ use docopt::Docopt;
 
 mod bx_index;
 mod locus;
+mod rpcache;
 
+use bx_index::BxListIter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "Usage: cargo run --release <input>";
@@ -447,7 +450,7 @@ struct FastqManager {
 impl FastqManager {
     pub fn new (
         out_dir: &Path,
-        formatter: &FormatBamRecords,
+        formatter: FormatBamRecords,
         _sample_name: String,
         reads_per_fastq: usize,
     ) -> Self {
@@ -793,13 +796,92 @@ pub fn inner<R: bam::Read>(
 ) -> Result<Vec<OutPaths>, Error> {
     bam.set_threads( args.flag_nthreads)?;
     let formatter = {
-        let formatter = {
-            FormatBamRecords::c4head(&bam)
-        };
+        FormatBamRecords::c4head(&bam)
     };
-}ßß
+
+    let out_path = Path::new(&args.arg_output_path);
+    create_dir(&args.arg_output_path).context(anyhow!(
+        "error creating output dir"
+    ))?;
+
+    let fq = FastqManager::new(
+        out_path, 
+        formatter.clone(), 
+        "bam2fastq".to_string(), 
+        args.flag_reads_per_fastq
+    );
+
+    if formatter.is_double_ended() {
+        if args.flag_bx_list.is_some() {
+            let bxi = bx_index::BxIndex::new(args.arg_bam)?;
+            let bx_iter = BxListIter::from_path(
+                args.flag_bx_list.unwrap(), 
+                bxi, 
+                bam
+            )?;
+            proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.flag_relaxed)
+        } else {
+            proc_double_ended(
+                bam.records(),
+                formatter,
+                fq,
+                cache_size,
+                args.flag_locus.is_some(),
+                args.flag_relaxed,
+            )
+        }
+    } else if args.flag_bx_list.is_some() {
+        let bxi = bx_index::BxIndex::new(args.arg_bam)?;
+        let bx_iter = BxListIter::from_path(args.flag_bx_list.unwrap(), bxi, bam)?;
+        proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.flag_relaxed)
+    } else {
+        proc_single_ended(bam.records(), formatter, fq)
+    }
+}
 
 
+fn proc_double_ended<I, E> (
+    records: I,
+    formatter: FormatBamRecords,
+    mut fq: FastqManager,
+    cache_size: usize,
+    retricted_locus: bool,
+    relaxed: bool,
+) -> Result<Vec<OutPaths>, Error>
+where 
+    I: Iterator<Item = Result<Record, E>>,
+    Result<Record, E>: Context<Record, E>,
+{
+    let temp_file = tempfile::NamedTempFile::new_in(&fq.out_dir)?;
+    let total_read_pairs = {
+        let mut rp_cache = RpCache::new(cache_size, relaxed);
+        let w: ShardWriter<SerFq, SerFqSort> = ShardWriter::new(
+            temp_file.path(), 
+            32, 
+            2048, 
+            1 << 21
+        )?;
+        let mut sender = w.get_sender();
+        let mut totble_read_pairs = 0;
+
+        for _rec in records {
+            let rec = _rec.context("Error when reading BAM")?;
+            
+        }
+    }
+
+}
+
+fn proc_single_ended<I>(
+    records: I,
+    formatter: FormatBamRecords,
+    mut fq: FastqManager,
+) -> Result<Vec<OutPaths>, Error>
+where
+    I: Iterator<Item = Result<Record, rust_htslib::errors::Error>>,
+{
+
+}
 
 
 fn main() {
