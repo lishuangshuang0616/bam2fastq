@@ -7,7 +7,7 @@ use shardio::helper::ThreadProxyWriter;
 use shardio::SortKey;
 use shardio::{ShardReader, ShardWriter};
 use rust_htslib::bam::record::{Aux, Record};
-use rust_htslib::bam::{self, Read};
+use rust_htslib::bam::{self, header, Read};
 use regex::Regex;
 use itertools::Itertools;
 use anyhow::{Error, anyhow, Context};
@@ -481,6 +481,30 @@ impl FastqManager {
             out_dir: out_dir.to_path_buf(),
         }
     }
+
+    pub fn write(
+        &mut self,
+        rg: &Option<Rg>,
+        r1: &FqRecord,
+        r2: &FqRecord,
+        i1: &Option<FqRecord>,
+        i2: &Option<FqRecord>,
+    ) {
+        if let &Some(ref rg) = rg {
+            self.writers.get_mut(rg).map(|w| w.write(r1, r2, i1, i2));
+        }
+    }
+
+    pub fn total_written(&self) -> usize {
+        self.writers.iter().map(|(_, w)| w.total_written).sum()
+    }
+
+    pub fn paths(&self) -> Vec<(PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>)> {
+        self.writers
+            .iter()
+            .flat_map(|(_, w)| w.path_sets.clone())
+            .collect()
+    }
 }
 
 
@@ -878,9 +902,70 @@ where
                 (true, true) => {
                     return Err(anyhow!("Read has both r1 and r2 flags: {}", str::from_utf8(rec.qname()).unwrap()))
                 }
+                (true, false) => totble_read_pairs += 1,
+                (false, true) => (),
+            }
+
+            let tid = rec.tid();
+            let pos = rec.pos();
+
+            if let Some((r1, r2)) = rp_cache.cache_rec(rec) {
+                let (rg, fq1, fq2, fq_i1, fq_i2) = formatter
+                    .format_read_pair(&r1, &r2)
+                    .unwrap();
+                fq.write(&rg, &fq1, &fq2, &fq_i1, &fq_i2)
+            }
+
+            if rp_cache.len() > cache_size {
+                for orphan in rp_cache.clear_orphans(tid, pos) {
+                    let ser = formatter.bam_rec_to_ser(&orphan)?;
+                    sender.send(ser)?;
+                }
             }
         }
+
+        for (_, orphan) in rp_cache.cache.drain() {
+            let ser = formatter.bam_rec_to_ser(&orphan)?;
+            sender.send(ser)?;
+        }
+
+        totble_read_pairs
+    };
+
+    let reader = ShardReader::<SerFq, SerFqSort>::open(temp_file.path())?;
+    let mut ncached = 0;
+    for (_, items) in &reader
+        .iter()?
+        .chunk_by(|x| x.as_ref().ok().map(|x| x.header_key.clone()))
+    {
+        let _item_vec: Result<Vec<SerFq>, _> = items.collect();
+        let mut item_vec = _item_vec?;
+        if item_vec.len() != 2 && !retricted_locus {
+            let header = str::from_utf8(&item_vec[0].rec.head).unwrap();
+            if !relaxed {
+                let msg = anyhow!("Didn't find both records for a paired end read. Is your BAM file complete?\nRead name of unpaired record: {}", header);
+                return Err(msg);
+            } else {
+                println!("Didn't find both records for a paired end read. Skipping. Read name of unpaired record: {}", header);
+            }
+        }
+        if item_vec.len() != 2 && retricted_locus{
+            continue;
+        }
+
+        item_vec.sort_by_key(|x| x.read_num);
+        let r1 = item_vec.swap_remove(0);
+        let r2 = item_vec.swap_remove(0);
+        fq.write(&r1.read_group, &r1.rec, &r2.rec, &r1.i1, &r1.i2);
+        ncached += 1;
     }
+    println!(
+        "Writing finished.  Observed {} unique read ids. Wrote {} read pairs ({} cached)",
+        total_read_pairs,
+        fq.total_written(),
+        ncached
+    );
+    Ok(fq.paths())
 
 }
 
@@ -892,7 +977,33 @@ fn proc_single_ended<I>(
 where
     I: Iterator<Item = Result<Record, rust_htslib::errors::Error>>,
 {
+    let total_reads = {
+        // Count total R1s observed, so we can make sure we've preserved all read pairs
+        let mut total_reads = 0;
 
+        for _rec in records {
+            let rec = _rec.context("Error when reading BAM")?;
+
+            if rec.is_secondary() || rec.is_supplementary() {
+                continue;
+            }
+
+            total_reads += 1;
+
+            let (rg, fq1, fq2, fq_i1, fq_i2) = formatter.format_read(&rec)?;
+            fq.write(&rg, &fq1, &fq2, &fq_i1, &fq_i2);
+        }
+
+        total_reads
+    };
+
+    // make sure we have the right number of output reads
+    println!(
+        "Writing finished.  Observed {} read pairs. Wrote {} read pairs",
+        total_reads,
+        fq.total_written()
+    );
+    Ok(fq.paths())
 }
 
 
@@ -907,4 +1018,17 @@ fn main() {
 
     let traceback = args.flag_traceback;
     let res = go(args, None);
+
+    if let Err(ref e) = res {
+        println!("bam2fastq error: {e}\n");
+
+        println!("If this error is unexpected. Please re-run with --traceback and include stack trace with an error report");
+
+        if traceback {
+            println!("see below for more details:");
+            println!("==========================");
+            println!("{}\n{}", e, e.backtrace());
+        };
+        ::std::process::exit(1);
+    }
 }
