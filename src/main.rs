@@ -875,6 +875,9 @@ where
                 (false, false) => {
                     return Err(anyhow!("Not single-end read {}", str::from_utf8(rec.qname()).unwrap()))
                 }
+                (true, true) => {
+                    return Err(anyhow!("Read has both r1 and r2 flags: {}", str::from_utf8(rec.qname()).unwrap()))
+                }
             }
         }
     }
