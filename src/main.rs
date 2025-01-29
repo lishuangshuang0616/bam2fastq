@@ -15,6 +15,7 @@ use flate2::write::GzEncoder;
 use std::fs::{create_dir, File};
 use std::panic;
 use std::path::Path;
+use std::str;
 use docopt::Docopt;
 
 mod bx_index;
@@ -866,7 +867,15 @@ where
 
         for _rec in records {
             let rec = _rec.context("Error when reading BAM")?;
-            
+            if rec.is_secondary() || rec.is_supplementary() {
+                continue;
+            }
+
+            match (rec.is_first_in_template(), rec.is_last_in_template()) {
+                (false, false) => {
+                    return Err(anyhow!("Not single-end read {}", str::from_utf8(rec.qname()).unwrap()))
+                }
+            }
         }
     }
 
