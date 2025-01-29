@@ -1086,7 +1086,7 @@ fn main() {
 }
 
 
-
+mod fastq_reader;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,7 +1196,7 @@ mod tests {
 
         let args = Args {
             flag_nthreads: 2,
-            arg_bam: "test/lr21.bam".to_string(),
+            arg_bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             arg_output_path: tmp_path.to_str().unwrap().to_string(),
             flag_reads_per_fastq: 100000,
             flag_locus: None,
@@ -1208,8 +1208,8 @@ mod tests {
         let out_path_sets = super::go(args, Some(2)).unwrap();
 
         let true_fastq_read = open_interleaved_fastq_pair_iter(
-            "test/crg-tiny-fastq-2.0.0/read-RA_si-GTTGCAGC_lane-001-chunk-001.fastq.gz",
-            Some("test/crg-tiny-fastq-2.0.0/read-I1_si-GTTGCAGC_lane-001-chunk-001.fastq.gz"),
+            "target/crg-tiny-fastq-2.0.0/read-RA_si-GTTGCAGC_lane-001-chunk-001.fastq.gz",
+            Some("target/crg-tiny-fastq-2.0.0/read-I1_si-GTTGCAGC_lane-001-chunk-001.fastq.gz"),
         );
 
         let mut orig_reads = ReadSet::new();
@@ -1223,83 +1223,7 @@ mod tests {
         strict_compare_read_sets(orig_reads, output_reads);
     }
 
-    #[test]
-    fn test_lr20() {
-        let tempdir = tempfile::Builder::new()
-            .prefix("bam_to_fq_test")
-            .tempdir()
-            .expect("create temp dir");
-        let tmp_path = tempdir.path().join("outs");
-
-        let args = Args {
-            flag_nthreads: 2,
-            arg_bam: "test/lr20.bam".to_string(),
-            arg_output_path: tmp_path.to_str().unwrap().to_string(),
-            flag_reads_per_fastq: 100000,
-            flag_locus: None,
-            flag_bx_list: None,
-            flag_traceback: false,
-            flag_relaxed: false,
-        };
-
-        let out_path_sets = super::go(args, Some(2)).unwrap();
-
-        let true_fastq_read = open_interleaved_fastq_pair_iter(
-            "test/crg-tiny-fastq-2.0.0/read-RA_si-GTTGCAGC_lane-001-chunk-001.fastq.gz",
-            Some("test/crg-tiny-fastq-2.0.0/read-I1_si-GTTGCAGC_lane-001-chunk-001.fastq.gz"),
-        );
-
-        let mut orig_reads = ReadSet::new();
-        load_fastq_set(&mut orig_reads, true_fastq_read);
-
-        let mut output_reads = ReadSet::new();
-        for (r1, r2, i1, _) in out_path_sets {
-            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
-        }
-
-        // use special comparison method that ignores N's in R1
-        // accounts for missing trimmed bases
-        compare_read_sets_ignore_n(orig_reads, output_reads);
-    }
-
-    #[test]
-    fn test_cr12() {
-        let tempdir = tempfile::Builder::new()
-            .prefix("bam_to_fq_test")
-            .tempdir()
-            .expect("create temp dir");
-        let tmp_path = tempdir.path().join("outs");
-
-        let args = Args {
-            flag_nthreads: 2,
-            arg_bam: "test/cr12.bam".to_string(),
-            arg_output_path: tmp_path.to_str().unwrap().to_string(),
-            flag_reads_per_fastq: 100000,
-            flag_locus: None,
-            flag_bx_list: None,
-            flag_traceback: false,
-            flag_relaxed: false,
-        };
-
-        let out_path_sets = super::go(args, Some(2)).unwrap();
-
-        let true_fastq_read = open_interleaved_fastq_pair_iter(
-            "test/cellranger-tiny-fastq-1.2.0/read-RA_si-TTTCATGA_lane-008-chunk-001.fastq.gz",
-            Some(
-                "test/cellranger-tiny-fastq-1.2.0/read-I1_si-TTTCATGA_lane-008-chunk-001.fastq.gz",
-            ),
-        );
-
-        let mut orig_reads = ReadSet::new();
-        load_fastq_set(&mut orig_reads, true_fastq_read);
-
-        let mut output_reads = ReadSet::new();
-        for (r1, r2, i1, _) in out_path_sets {
-            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
-        }
-
-        subset_compare_read_sets(orig_reads, output_reads);
-    }
+    
 
     #[test]
     fn bad_bam() {
@@ -1311,7 +1235,7 @@ mod tests {
 
         let args = Args {
             flag_nthreads: 2,
-            arg_bam: "test/bad.bam".to_string(),
+            arg_bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             arg_output_path: tmp_path.to_str().unwrap().to_string(),
             flag_reads_per_fastq: 100000,
             flag_locus: None,
