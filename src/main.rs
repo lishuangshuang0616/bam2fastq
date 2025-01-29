@@ -226,10 +226,6 @@ impl FormatBamRecords {
             .collect()
     }
 
-    // Example header line:
-    // @CO	10x_bam_to_fastq_seqnames:R1,R3,I1,R2
-    // In this case, the @CO header lines marked R1, R2, I1, I2 will
-    // be used to write reads to output files R1, R3, I1, and R2, respectively
     fn parse_seq_names<R: bam::Read>(reader: &R) -> Option<Vec<String>> {
         let text = String::from_utf8(Vec::from(reader.header().as_bytes())).unwrap();
         let re = Regex::new(r"@CO\t10x_bam_to_fastq_seqnames:(\S+)").unwrap();
@@ -245,6 +241,62 @@ impl FormatBamRecords {
             }
         }
         None
+    }
+
+    fn try_get_rg(&self, rec: &Record) -> Option<Rg> {
+        let rg = rec.aux(b"RG");
+        match rg {
+            Ok(Aux::String(s)) => {
+                let key = String::from_utf8(Vec::from(s)).unwrap();
+                self.rg_spec.get(&key).cloned()
+            }
+            Ok(..) => panic!(
+                "invalid type of RG header. record: {}",
+                str::from_utf8(rec.qname()).unwrap()
+            ),
+            Err(_) => None,
+        }
+    }
+
+    pub fn find_rg(&self, rec: &Record) -> Option<Rg> {
+        let main_rg_tag = self.try_get_rg(rec);
+
+        if main_rg_tag.is_some() {
+            main_rg_tag
+        } else {
+            let emit = |tag| {
+                let corrected_bc = String::from_utf8(Vec::from(tag)).unwrap();
+                let mut parts = corrected_bc.split('-');
+                let _ = parts.next();
+                match parts.next() {
+                    Some(v) => {
+                        match u32::from_str(v) {
+                            Ok(v) => {
+                                //println!("got gg: {}", v);
+                                let name = format!("gemgroup{:03}", v);
+                                self.rg_spec.get(&name).cloned()
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+            // Workaround for early CR 1.1 and 1.2 data
+            // Attempt to extract the gem group out of the corrected barcode tag (CB)
+            if let Ok(Aux::String(s)) = rec.aux(b"CB") {
+                return emit(s);
+            }
+
+            // Workaround for GemCode (Long Ranger 1.3) data
+            // Attempt to extract the gem group out of the corrected barcode tag (BX)
+            if let Ok(Aux::String(s)) = rec.aux(b"BX") {
+                return emit(s);
+            }
+
+            None
+        }
     }
 
     /// Convert a BAM record to a Fq record, for internal caching
@@ -1030,5 +1082,349 @@ fn main() {
             println!("{}\n{}", e, e.backtrace());
         };
         ::std::process::exit(1);
+    }
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fastq_reader::{open_fastq_pair_iter, open_interleaved_fastq_pair_iter, FqRec, RawReadSet};
+    use std::collections::HashMap;
+
+    type ReadSet = HashMap<Vec<u8>, RawReadSet>;
+
+    fn strip_extra_headers(header: &[u8]) -> Vec<u8> {
+        let head_str = String::from_utf8(header.to_owned()).unwrap();
+        let mut split = head_str.split_whitespace();
+        split.next().unwrap().to_string().into_bytes()
+    }
+
+    fn strip_header_fqrec(r: FqRec) -> FqRec {
+        (strip_extra_headers(&(r.0)), r.1, r.2)
+    }
+
+    fn strip_header_raw_read_set(r: RawReadSet) -> RawReadSet {
+        (
+            strip_header_fqrec(r.0),
+            strip_header_fqrec(r.1),
+            r.2.map(strip_header_fqrec),
+        )
+    }
+
+    // Load fastqs, but strip extra elements of the FASTQ header beyond the first space -- they will not be in the BAM
+    pub fn load_fastq_set<I: Iterator<Item = RawReadSet>>(reads: &mut ReadSet, iter: I) {
+        for r in iter {
+            reads.insert(
+                strip_extra_headers(&((r.0).0)),
+                strip_header_raw_read_set(r),
+            );
+        }
+    }
+
+    pub fn strict_compare_read_sets(orig_set: ReadSet, new_set: ReadSet) {
+        assert_eq!(orig_set.len(), new_set.len());
+
+        let mut keys1: Vec<Vec<u8>> = orig_set.keys().cloned().collect();
+        keys1.sort();
+
+        let mut keys2: Vec<Vec<u8>> = new_set.keys().cloned().collect();
+        keys2.sort();
+
+        for (k1, k2) in keys1.iter().zip(keys2.iter()) {
+            assert_eq!(k1, k2);
+            assert_eq!(orig_set.get(k1), new_set.get(k2));
+        }
+    }
+
+    pub fn subset_compare_read_sets(orig_set: ReadSet, new_set: ReadSet) {
+        assert!(orig_set.len() > new_set.len());
+
+        for k in new_set.keys() {
+            assert_eq!(new_set.get(k), orig_set.get(k))
+        }
+    }
+
+    pub fn compare_read_sets_ignore_n(orig_set: ReadSet, new_set: ReadSet) {
+        assert_eq!(orig_set.len(), new_set.len());
+
+        let mut keys1: Vec<Vec<u8>> = orig_set.keys().cloned().collect();
+        keys1.sort();
+
+        let mut keys2: Vec<Vec<u8>> = new_set.keys().cloned().collect();
+        keys2.sort();
+
+        assert_eq!(keys1, keys2);
+
+        for (k1, k2) in keys1.iter().zip(keys2.iter()) {
+            assert_eq!(k1, k2);
+            compare_raw_read_sets_ignore_n(orig_set.get(k1).unwrap(), new_set.get(k2).unwrap());
+        }
+    }
+
+    // Relax the comparison for R1 -- if the v2 R1 read has 'N' or the v2 R1 qual has 'J', allow it through
+    // this handles the case where the 7 trimmed bases after the BC are were not retained in Long Ranger 2.0
+    // also ignore mismatches in the first 16bp, which are caused by the bug in LR 2.0 that caused the RX
+    // tag to have the corrected sequence rather than the raw sequence
+    pub fn compare_raw_read_sets_ignore_n(v1: &RawReadSet, v2: &RawReadSet) {
+        assert_eq!(&(v1.0).0, &(v2.0).0);
+        compare_bytes_ignore_n(&(v1.0).1, &(v2.0).1);
+        compare_bytes_ignore_n(&(v1.0).2, &(v2.0).2);
+
+        assert_eq!(v1.1, v2.1);
+        assert_eq!(v1.2, v2.2)
+    }
+
+    pub fn compare_bytes_ignore_n(v1: &[u8], v2: &[u8]) {
+        assert_eq!(v1.len(), v2.len());
+        for (idx, (b1, b2)) in v1.iter().zip(v2).enumerate() {
+            if idx >= 16 && b1 != b2 && *b2 != b'N' && *b2 != b'J' {
+                println!("got mismatch at pos: {}", idx);
+                assert_eq!(v1, v2)
+            }
+        }
+    }
+
+    #[test]
+    fn test_lr21() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("bam_to_fq_test")
+            .tempdir()
+            .expect("create temp dir");
+        let tmp_path = tempdir.path().join("outs");
+
+        let args = Args {
+            flag_nthreads: 2,
+            arg_bam: "test/lr21.bam".to_string(),
+            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            flag_reads_per_fastq: 100000,
+            flag_locus: None,
+            flag_bx_list: None,
+            flag_traceback: false,
+            flag_relaxed: false,
+        };
+
+        let out_path_sets = super::go(args, Some(2)).unwrap();
+
+        let true_fastq_read = open_interleaved_fastq_pair_iter(
+            "test/crg-tiny-fastq-2.0.0/read-RA_si-GTTGCAGC_lane-001-chunk-001.fastq.gz",
+            Some("test/crg-tiny-fastq-2.0.0/read-I1_si-GTTGCAGC_lane-001-chunk-001.fastq.gz"),
+        );
+
+        let mut orig_reads = ReadSet::new();
+        load_fastq_set(&mut orig_reads, true_fastq_read);
+
+        let mut output_reads = ReadSet::new();
+        for (r1, r2, i1, _) in out_path_sets {
+            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
+        }
+
+        strict_compare_read_sets(orig_reads, output_reads);
+    }
+
+    #[test]
+    fn test_lr20() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("bam_to_fq_test")
+            .tempdir()
+            .expect("create temp dir");
+        let tmp_path = tempdir.path().join("outs");
+
+        let args = Args {
+            flag_nthreads: 2,
+            arg_bam: "test/lr20.bam".to_string(),
+            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            flag_reads_per_fastq: 100000,
+            flag_locus: None,
+            flag_bx_list: None,
+            flag_traceback: false,
+            flag_relaxed: false,
+        };
+
+        let out_path_sets = super::go(args, Some(2)).unwrap();
+
+        let true_fastq_read = open_interleaved_fastq_pair_iter(
+            "test/crg-tiny-fastq-2.0.0/read-RA_si-GTTGCAGC_lane-001-chunk-001.fastq.gz",
+            Some("test/crg-tiny-fastq-2.0.0/read-I1_si-GTTGCAGC_lane-001-chunk-001.fastq.gz"),
+        );
+
+        let mut orig_reads = ReadSet::new();
+        load_fastq_set(&mut orig_reads, true_fastq_read);
+
+        let mut output_reads = ReadSet::new();
+        for (r1, r2, i1, _) in out_path_sets {
+            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
+        }
+
+        // use special comparison method that ignores N's in R1
+        // accounts for missing trimmed bases
+        compare_read_sets_ignore_n(orig_reads, output_reads);
+    }
+
+    #[test]
+    fn test_cr12() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("bam_to_fq_test")
+            .tempdir()
+            .expect("create temp dir");
+        let tmp_path = tempdir.path().join("outs");
+
+        let args = Args {
+            flag_nthreads: 2,
+            arg_bam: "test/cr12.bam".to_string(),
+            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            flag_reads_per_fastq: 100000,
+            flag_locus: None,
+            flag_bx_list: None,
+            flag_traceback: false,
+            flag_relaxed: false,
+        };
+
+        let out_path_sets = super::go(args, Some(2)).unwrap();
+
+        let true_fastq_read = open_interleaved_fastq_pair_iter(
+            "test/cellranger-tiny-fastq-1.2.0/read-RA_si-TTTCATGA_lane-008-chunk-001.fastq.gz",
+            Some(
+                "test/cellranger-tiny-fastq-1.2.0/read-I1_si-TTTCATGA_lane-008-chunk-001.fastq.gz",
+            ),
+        );
+
+        let mut orig_reads = ReadSet::new();
+        load_fastq_set(&mut orig_reads, true_fastq_read);
+
+        let mut output_reads = ReadSet::new();
+        for (r1, r2, i1, _) in out_path_sets {
+            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
+        }
+
+        subset_compare_read_sets(orig_reads, output_reads);
+    }
+
+    #[test]
+    fn bad_bam() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("bam_to_fq_test")
+            .tempdir()
+            .expect("create temp dir");
+        let tmp_path = tempdir.path().join("outs");
+
+        let args = Args {
+            flag_nthreads: 2,
+            arg_bam: "test/bad.bam".to_string(),
+            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            flag_reads_per_fastq: 100000,
+            flag_locus: None,
+            flag_bx_list: None,
+            flag_traceback: false,
+            flag_relaxed: false,
+        };
+
+        let res = super::go(args, Some(2));
+
+        println!("res: {:?}", res);
+    }
+
+    #[test]
+    fn unpaired_record() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("bam_to_fq_test")
+            .tempdir()
+            .expect("create temp dir");
+        let tmp_path = tempdir.path().join("outs");
+
+        let args = Args {
+            flag_nthreads: 2,
+            arg_bam: "test/unpaired_record.bam".to_string(),
+            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            flag_reads_per_fastq: 100000,
+            flag_locus: None,
+            flag_bx_list: None,
+            flag_traceback: false,
+            flag_relaxed: false,
+        };
+
+        let res = super::go(args, Some(2));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn wrong_header() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("bam_to_fq_test")
+            .tempdir()
+            .expect("create temp dir");
+        let tmp_path = tempdir.path().join("outs");
+
+        let args = Args {
+            flag_nthreads: 2,
+            arg_bam: "test/wrong_header.bam".to_string(),
+            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            flag_reads_per_fastq: 100000,
+            flag_locus: None,
+            flag_bx_list: None,
+            flag_traceback: false,
+            flag_relaxed: false,
+        };
+
+        let res = super::go(args, Some(2));
+
+        println!("res: {:?}", res);
+    }
+
+    #[test]
+    fn test_cr12_v1() {
+        let tempdir = tempfile::Builder::new()
+            .prefix("bam_to_fq_test")
+            .tempdir()
+            .expect("create temp dir");
+        let tmp_path = tempdir.path().join("outs");
+
+        let args = Args {
+            flag_nthreads: 2,
+            arg_bam: "test/cr12-v1.bam".to_string(),
+            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            flag_reads_per_fastq: 100000,
+            flag_locus: None,
+            flag_bx_list: None,
+            flag_traceback: false,
+            flag_relaxed: false,
+        };
+
+        let out_path_sets = super::go(args, Some(2)).unwrap();
+
+        let true_fastq_read = open_interleaved_fastq_pair_iter(
+            "test/cellranger-3p-v1/read-RA_si-ACCAGTCC_lane-001-chunk-000.fastq.gz",
+            Some("test/cellranger-3p-v1/read-I1_si-ACCAGTCC_lane-001-chunk-000.fastq.gz"),
+        );
+
+        let mut orig_reads = ReadSet::new();
+        load_fastq_set(&mut orig_reads, true_fastq_read);
+
+        let mut output_reads = ReadSet::new();
+        for (r1, r2, i1, _) in out_path_sets.clone() {
+            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
+        }
+
+        subset_compare_read_sets(orig_reads, output_reads);
+
+        // Separately test I1 & I2 as if they were the main reads.
+        let true_index_reads = open_fastq_pair_iter(
+            "test/cellranger-3p-v1/read-I1_si-ACCAGTCC_lane-001-chunk-000.fastq.gz",
+            "test/cellranger-3p-v1/read-I2_si-ACCAGTCC_lane-001-chunk-000.fastq.gz",
+            None,
+        );
+        let mut orig_index_reads = ReadSet::new();
+        load_fastq_set(&mut orig_index_reads, true_index_reads);
+
+        let mut output_index_reads = ReadSet::new();
+        for (_, _, i1, i2) in out_path_sets {
+            load_fastq_set(
+                &mut output_index_reads,
+                open_fastq_pair_iter(i1.unwrap(), i2.unwrap(), None),
+            );
+        }
+
+        subset_compare_read_sets(orig_index_reads, output_index_reads);
     }
 }
