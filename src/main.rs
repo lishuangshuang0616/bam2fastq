@@ -138,11 +138,12 @@ impl FormatBamRecords {
             .collect::<HashMap<_, _>>();
 
         if rg_items.is_empty() {
-            for i in 1..100 {
-                let name = format!("gemgroup{:03}", i);
+            for i in 1..2 {
+                let name = format!("result{:01}", i);
                 rg_items.insert(name.clone(), (name, 0));
             }
         }
+        println!("{:?}",rg_items);
 
         rg_items
     }
@@ -199,7 +200,7 @@ impl FormatBamRecords {
                         match u32::from_str(v) {
                             Ok(v) => {
                                 //println!("got gg: {}", v);
-                                let name = format!("gemgroup{:03}", v);
+                                let name = format!("result{:01}", v);
                                 self.rg_spec.get(&name).cloned()
                             }
                             _ => None,
@@ -209,14 +210,10 @@ impl FormatBamRecords {
                 }
             };
 
-            // Workaround for early CR 1.1 and 1.2 data
-            // Attempt to extract the gem group out of the corrected barcode tag (CB)
             if let Ok(Aux::String(s)) = rec.aux(b"CB") {
                 return emit(s);
             }
 
-            // Workaround for GemCode (Long Ranger 1.3) data
-            // Attempt to extract the gem group out of the corrected barcode tag (BX)
             if let Ok(Aux::String(s)) = rec.aux(b"BX") {
                 return emit(s);
             }
@@ -310,8 +307,16 @@ impl FormatBamRecords {
         read_number: u32,
     ) -> Result<FqRecord, Error> {
         let mut head = Vec::new();
-        head.extend_from_slice(rec.qname());
-        let head_suffix = format!(" {}:N:0:0", read_number);
+        let qname = rec.qname();
+        // 找到斜杠的位置（如果存在）
+        let base_name = if let Some(pos) = qname.iter().position(|&x| x == b'/') {
+            &qname[..pos]
+        } else {
+            qname
+        };
+        // 构建新的 header
+        head.extend_from_slice(base_name);
+        let head_suffix = format!("/{}", read_number);
         head.extend(head_suffix.as_bytes());
 
         // Reconstitute read and QVs
@@ -447,7 +452,7 @@ impl FastqManager {
                 path,
                 formatter.clone(),
                 "bam2fastq".to_string(),
-                lane,
+                1,
                 reads_per_fastq,
             );
 
@@ -468,8 +473,18 @@ impl FastqManager {
         i1: &Option<FqRecord>,
         i2: &Option<FqRecord>,
     ) {
-        if let &Some(ref rg) = rg {
-            self.writers.get_mut(rg).map(|w| w.write(r1, r2, i1, i2));
+        match rg {
+            Some(ref rg) => {
+                if let Some(w) = self.writers.get_mut(rg) {
+                    w.write(r1, r2, i1, i2).expect("Failed to write records");
+                }
+            },
+            None => {
+                // 如果没有 RG，使用第一个可用的 writer
+                if let Some(w) = self.writers.values_mut().next() {
+                    w.write(r1, r2, i1, i2).expect("Failed to write records");
+                }
+            }
         }
     }
 
@@ -539,25 +554,25 @@ impl FastqWriter {
     ) -> (PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>) {
         if formatter.rename.is_none() {
             let r1 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_1.fastq.gz", 
+                "{}_L{:02}_{:01}_1.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1
             ));
             let r2 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_2.fastq.gz", 
+                "{}_L{:02}_{:01}_2.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1
             ));
             let i1 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_I1.fastq.gz", 
+                "{}_L{:02}_{:01}_I1.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1
             ));
             let i2 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_I2.fastq.gz", 
+                "{}_L{:02}_{:01}_I2.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1
@@ -580,28 +595,28 @@ impl FastqWriter {
             let new_read_names = formatter.rename.as_ref().unwrap();
 
             let r1 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1,
                 new_read_names[0]
             ));
             let r2 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1,
                 new_read_names[1]
             ));
             let i1 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1,
                 new_read_names[2]
             ));
             let i2 = out_dir.join(format!(
-                "{}_L{:02}_{:02}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.fastq.gz", 
                 sample_name, 
                 lane,
                 n_files + 1,
@@ -801,6 +816,7 @@ pub fn inner<R: bam::Read>(
     let formatter = {
         FormatBamRecords::c4head(&bam)
     };
+    println!("{:?}", formatter);
 
     let out_path = Path::new(&args.arg_output_path);
     create_dir(&args.arg_output_path).context(anyhow!(
@@ -1022,10 +1038,10 @@ mod tests {
         let output_dir = "target/fastq_results";
 
         let args = Args {
-            flag_nthreads: 2,
+            flag_nthreads: 10,
             arg_bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             arg_output_path: output_dir.to_string(),
-            flag_reads_per_fastq: 100000,
+            flag_reads_per_fastq: 100000000,
             flag_locus: None,
             flag_bx_list: None,
             flag_traceback: false,
@@ -1033,7 +1049,7 @@ mod tests {
         };
 
         // 运行转换
-        let out_path_sets = super::go(args, Some(2)).unwrap();
+        let out_path_sets = super::go(args, Some(1000000)).unwrap();
         
         // 打印结果文件路径
         println!("\n生成的FASTQ文件:");
