@@ -81,11 +81,12 @@ impl SortKey<SerFq> for SerFqSort {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SpecEntry {
     Tags(String, String),
+    #[allow(dead_code)]
     Ns(usize),
-    Read
+    Read,
 }
 
 #[derive(Debug, Clone)]
@@ -137,10 +138,6 @@ impl FormatBamRecords {
             .collect::<HashMap<_, _>>();
 
         if rg_items.is_empty() {
-            println!("WARNING: no @RG (read group) headers found in BAM file. Splitting data by the GEM well marked in the corrected barcode tag.");
-            println!("Reads without a corrected barcode will not appear in output FASTQs");
-            // No RG items in header -- invent a set fixed set of RGs
-            // each observed Gem group in the BAM file will get mapped to these.
             for i in 1..100 {
                 let name = format!("gemgroup{:03}", i);
                 rg_items.insert(name.clone(), (name, 0));
@@ -164,8 +161,6 @@ impl FormatBamRecords {
         match u32::from_str(lane) {
             Ok(n) => Some((v.to_string(), (rg.to_string(), n))),
             Err(_) => {
-                // Handle case in ALIGNER pipeline prior to 2.1.3 -- samtools merge would append a unique identifier to each RG ID tags
-                // Detect this condition and remove from lane
                 let re = Regex::new(r"^([0-9]+)-[0-9A-F]+$").unwrap();
                 let cap = re.captures(lane)?;
                 let lane_u32 = u32::from_str(cap.get(1).unwrap().as_str()).unwrap();
