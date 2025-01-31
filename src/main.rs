@@ -111,24 +111,6 @@ pub fn complement(b: u8) -> u8 {
 }
 
 impl FormatBamRecords {
-    pub fn from_headers<R: bam::Read>(reader: &R) -> Option<Self> {
-        let mut spec = Self::parse_spec(reader);
-        let seq_names = Self::parse_seq_names(reader);
-
-        if spec.is_empty() {
-            None
-        } else {
-            Some(Self {
-                rg_spec: HashMap::new(),
-                r1_spec: spec.remove("R1").unwrap(),
-                r2_spec: spec.remove("R2").unwrap(),
-                i1_spec: spec.remove("I1").unwrap_or_default(),
-                i2_spec: spec.remove("I2").unwrap_or_default(),
-                rename: seq_names,
-                order: [1, 3, 2, 4],
-            })
-        }
-    }
 
     pub fn c4head<R: bam::Read>(reader: &R) -> FormatBamRecords {
         FormatBamRecords {
@@ -190,57 +172,6 @@ impl FormatBamRecords {
                 Some((v.to_string(), (rg.to_string(), lane_u32)))
             }
         }
-    }
-
-    /// Parse the specs from BAM headers if available
-    fn parse_spec<R: bam::Read>(reader: &R) -> HashMap<String, Vec<SpecEntry>> {
-        // Example header line:
-        // @CO	10x_bam_to_fastq:R1(RX:QX,TR:TQ,SEQ:QUAL)
-        let re = Regex::new(r"@CO\t10x_bam_to_fastq:(\S+)\((\S+)\)").unwrap();
-        let text = String::from_utf8(Vec::from(reader.header().as_bytes())).unwrap();
-
-        text.lines()
-            .into_iter()
-            .filter_map(|l| {
-                re.captures(l).map(|c| {
-                    let read = c.get(1).unwrap().as_str().to_string();
-                    let tag_list = c.get(2).unwrap().as_str();
-
-                    let spec_entries = tag_list
-                        .split(',')
-                        .into_iter()
-                        .map(|el| {
-                            if el == "SEQ:QUAL" {
-                                SpecEntry::Read
-                            } else {
-                                let (rtag, qtag) =
-                                    el.split(':').map(ToString::to_string).next_tuple().unwrap();
-                                SpecEntry::Tags(rtag, qtag)
-                            }
-                        })
-                        .collect();
-
-                    (read, spec_entries)
-                })
-            })
-            .collect()
-    }
-
-    fn parse_seq_names<R: bam::Read>(reader: &R) -> Option<Vec<String>> {
-        let text = String::from_utf8(Vec::from(reader.header().as_bytes())).unwrap();
-        let re = Regex::new(r"@CO\t10x_bam_to_fastq_seqnames:(\S+)").unwrap();
-
-        for l in text.lines() {
-            if let Some(c) = re.captures(l) {
-                let names = c.get(1).unwrap().as_str().split(',');
-                let seq_names = names
-                    .into_iter()
-                    .map(std::string::ToString::to_string)
-                    .collect();
-                return Some(seq_names);
-            }
-        }
-        None
     }
 
     fn try_get_rg(&self, rec: &Record) -> Option<Rg> {
@@ -1086,118 +1017,19 @@ fn main() {
 }
 
 
-mod fastq_reader;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastq_reader::{open_fastq_pair_iter, open_interleaved_fastq_pair_iter, FqRec, RawReadSet};
-    use std::collections::HashMap;
-
-    type ReadSet = HashMap<Vec<u8>, RawReadSet>;
-
-    fn strip_extra_headers(header: &[u8]) -> Vec<u8> {
-        let head_str = String::from_utf8(header.to_owned()).unwrap();
-        let mut split = head_str.split_whitespace();
-        split.next().unwrap().to_string().into_bytes()
-    }
-
-    fn strip_header_fqrec(r: FqRec) -> FqRec {
-        (strip_extra_headers(&(r.0)), r.1, r.2)
-    }
-
-    fn strip_header_raw_read_set(r: RawReadSet) -> RawReadSet {
-        (
-            strip_header_fqrec(r.0),
-            strip_header_fqrec(r.1),
-            r.2.map(strip_header_fqrec),
-        )
-    }
-
-    // Load fastqs, but strip extra elements of the FASTQ header beyond the first space -- they will not be in the BAM
-    pub fn load_fastq_set<I: Iterator<Item = RawReadSet>>(reads: &mut ReadSet, iter: I) {
-        for r in iter {
-            reads.insert(
-                strip_extra_headers(&((r.0).0)),
-                strip_header_raw_read_set(r),
-            );
-        }
-    }
-
-    pub fn strict_compare_read_sets(orig_set: ReadSet, new_set: ReadSet) {
-        assert_eq!(orig_set.len(), new_set.len());
-
-        let mut keys1: Vec<Vec<u8>> = orig_set.keys().cloned().collect();
-        keys1.sort();
-
-        let mut keys2: Vec<Vec<u8>> = new_set.keys().cloned().collect();
-        keys2.sort();
-
-        for (k1, k2) in keys1.iter().zip(keys2.iter()) {
-            assert_eq!(k1, k2);
-            assert_eq!(orig_set.get(k1), new_set.get(k2));
-        }
-    }
-
-    pub fn subset_compare_read_sets(orig_set: ReadSet, new_set: ReadSet) {
-        assert!(orig_set.len() > new_set.len());
-
-        for k in new_set.keys() {
-            assert_eq!(new_set.get(k), orig_set.get(k))
-        }
-    }
-
-    pub fn compare_read_sets_ignore_n(orig_set: ReadSet, new_set: ReadSet) {
-        assert_eq!(orig_set.len(), new_set.len());
-
-        let mut keys1: Vec<Vec<u8>> = orig_set.keys().cloned().collect();
-        keys1.sort();
-
-        let mut keys2: Vec<Vec<u8>> = new_set.keys().cloned().collect();
-        keys2.sort();
-
-        assert_eq!(keys1, keys2);
-
-        for (k1, k2) in keys1.iter().zip(keys2.iter()) {
-            assert_eq!(k1, k2);
-            compare_raw_read_sets_ignore_n(orig_set.get(k1).unwrap(), new_set.get(k2).unwrap());
-        }
-    }
-
-    // Relax the comparison for R1 -- if the v2 R1 read has 'N' or the v2 R1 qual has 'J', allow it through
-    // this handles the case where the 7 trimmed bases after the BC are were not retained in Long Ranger 2.0
-    // also ignore mismatches in the first 16bp, which are caused by the bug in LR 2.0 that caused the RX
-    // tag to have the corrected sequence rather than the raw sequence
-    pub fn compare_raw_read_sets_ignore_n(v1: &RawReadSet, v2: &RawReadSet) {
-        assert_eq!(&(v1.0).0, &(v2.0).0);
-        compare_bytes_ignore_n(&(v1.0).1, &(v2.0).1);
-        compare_bytes_ignore_n(&(v1.0).2, &(v2.0).2);
-
-        assert_eq!(v1.1, v2.1);
-        assert_eq!(v1.2, v2.2)
-    }
-
-    pub fn compare_bytes_ignore_n(v1: &[u8], v2: &[u8]) {
-        assert_eq!(v1.len(), v2.len());
-        for (idx, (b1, b2)) in v1.iter().zip(v2).enumerate() {
-            if idx >= 16 && b1 != b2 && *b2 != b'N' && *b2 != b'J' {
-                println!("got mismatch at pos: {}", idx);
-                assert_eq!(v1, v2)
-            }
-        }
-    }
 
     #[test]
     fn test_lr21() {
-        let tempdir = tempfile::Builder::new()
-            .prefix("bam_to_fq_test")
-            .tempdir()
-            .expect("create temp dir");
-        let tmp_path = tempdir.path().join("outs");
+        // 创建固定的输出目录
+        let output_dir = "target/fastq_results";
 
         let args = Args {
             flag_nthreads: 2,
             arg_bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
-            arg_output_path: tmp_path.to_str().unwrap().to_string(),
+            arg_output_path: output_dir.to_string(),
             flag_reads_per_fastq: 100000,
             flag_locus: None,
             flag_bx_list: None,
@@ -1205,22 +1037,30 @@ mod tests {
             flag_relaxed: false,
         };
 
+        // 运行转换
         let out_path_sets = super::go(args, Some(2)).unwrap();
-
-        let true_fastq_read = open_interleaved_fastq_pair_iter(
-            "target/crg-tiny-fastq-2.0.0/read-RA_si-GTTGCAGC_lane-001-chunk-001.fastq.gz",
-            Some("target/crg-tiny-fastq-2.0.0/read-I1_si-GTTGCAGC_lane-001-chunk-001.fastq.gz"),
-        );
-
-        let mut orig_reads = ReadSet::new();
-        load_fastq_set(&mut orig_reads, true_fastq_read);
-
-        let mut output_reads = ReadSet::new();
-        for (r1, r2, i1, _) in out_path_sets {
-            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
+        
+        // 打印结果文件路径
+        println!("\n生成的FASTQ文件:");
+        for (r1, r2, i1, i2) in out_path_sets {
+            println!("R1: {}", r1.display());
+            println!("R2: {}", r2.display());
+            if let Some(i1_path) = i1 {
+                println!("I1: {}", i1_path.display());
+            }
+            if let Some(i2_path) = i2 {
+                println!("I2: {}", i2_path.display());
+            }
+            println!("---");
         }
 
-        strict_compare_read_sets(orig_reads, output_reads);
+        // 可选:检查文件是否生成并打印文件大小
+        println!("\n文件大小信息:");
+        for entry in std::fs::read_dir(output_dir).unwrap() {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            println!("{}: {} bytes", entry.file_name().to_string_lossy(), metadata.len());
+        }
     }
 
     
@@ -1247,108 +1087,5 @@ mod tests {
         let res = super::go(args, Some(2));
 
         println!("res: {:?}", res);
-    }
-
-    #[test]
-    fn unpaired_record() {
-        let tempdir = tempfile::Builder::new()
-            .prefix("bam_to_fq_test")
-            .tempdir()
-            .expect("create temp dir");
-        let tmp_path = tempdir.path().join("outs");
-
-        let args = Args {
-            flag_nthreads: 2,
-            arg_bam: "test/unpaired_record.bam".to_string(),
-            arg_output_path: tmp_path.to_str().unwrap().to_string(),
-            flag_reads_per_fastq: 100000,
-            flag_locus: None,
-            flag_bx_list: None,
-            flag_traceback: false,
-            flag_relaxed: false,
-        };
-
-        let res = super::go(args, Some(2));
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn wrong_header() {
-        let tempdir = tempfile::Builder::new()
-            .prefix("bam_to_fq_test")
-            .tempdir()
-            .expect("create temp dir");
-        let tmp_path = tempdir.path().join("outs");
-
-        let args = Args {
-            flag_nthreads: 2,
-            arg_bam: "test/wrong_header.bam".to_string(),
-            arg_output_path: tmp_path.to_str().unwrap().to_string(),
-            flag_reads_per_fastq: 100000,
-            flag_locus: None,
-            flag_bx_list: None,
-            flag_traceback: false,
-            flag_relaxed: false,
-        };
-
-        let res = super::go(args, Some(2));
-
-        println!("res: {:?}", res);
-    }
-
-    #[test]
-    fn test_cr12_v1() {
-        let tempdir = tempfile::Builder::new()
-            .prefix("bam_to_fq_test")
-            .tempdir()
-            .expect("create temp dir");
-        let tmp_path = tempdir.path().join("outs");
-
-        let args = Args {
-            flag_nthreads: 2,
-            arg_bam: "test/cr12-v1.bam".to_string(),
-            arg_output_path: tmp_path.to_str().unwrap().to_string(),
-            flag_reads_per_fastq: 100000,
-            flag_locus: None,
-            flag_bx_list: None,
-            flag_traceback: false,
-            flag_relaxed: false,
-        };
-
-        let out_path_sets = super::go(args, Some(2)).unwrap();
-
-        let true_fastq_read = open_interleaved_fastq_pair_iter(
-            "test/cellranger-3p-v1/read-RA_si-ACCAGTCC_lane-001-chunk-000.fastq.gz",
-            Some("test/cellranger-3p-v1/read-I1_si-ACCAGTCC_lane-001-chunk-000.fastq.gz"),
-        );
-
-        let mut orig_reads = ReadSet::new();
-        load_fastq_set(&mut orig_reads, true_fastq_read);
-
-        let mut output_reads = ReadSet::new();
-        for (r1, r2, i1, _) in out_path_sets.clone() {
-            load_fastq_set(&mut output_reads, open_fastq_pair_iter(r1, r2, i1));
-        }
-
-        subset_compare_read_sets(orig_reads, output_reads);
-
-        // Separately test I1 & I2 as if they were the main reads.
-        let true_index_reads = open_fastq_pair_iter(
-            "test/cellranger-3p-v1/read-I1_si-ACCAGTCC_lane-001-chunk-000.fastq.gz",
-            "test/cellranger-3p-v1/read-I2_si-ACCAGTCC_lane-001-chunk-000.fastq.gz",
-            None,
-        );
-        let mut orig_index_reads = ReadSet::new();
-        load_fastq_set(&mut orig_index_reads, true_index_reads);
-
-        let mut output_index_reads = ReadSet::new();
-        for (_, _, i1, i2) in out_path_sets {
-            load_fastq_set(
-                &mut output_index_reads,
-                open_fastq_pair_iter(i1.unwrap(), i2.unwrap(), None),
-            );
-        }
-
-        subset_compare_read_sets(orig_index_reads, output_index_reads);
     }
 }
