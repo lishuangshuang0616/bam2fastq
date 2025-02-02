@@ -29,7 +29,7 @@ const USAGE: &str = "
 BAM to FASTQ Converter for Single Cell RNA-seq Data.
 
 Usage:
-  bamtofastq [options] <bam> <output-dir>
+  bamtofastq [options] <bam> <output-path>
   bamtofastq -h | --help
 
 Options:
@@ -39,7 +39,8 @@ Options:
   --reads-per-fastq=N  Reads per FASTQ file [default: 100000000]
   --relaxed            Skip unpaired or duplicated reads instead of throwing an error
   --bx-list=FILE       Only include BX values listed in text file L. Requires BX-sorted and index BAM file
-  
+  --traceback          Print full traceback if an error occurs
+
 ";
 
 type OutPaths = (
@@ -834,9 +835,11 @@ pub fn inner<R: bam::Read>(
     println!("{:?}", formatter);
 
     let out_path = Path::new(&args.arg_output_path);
-    create_dir(&args.arg_output_path).context(anyhow!(
-        "error creating output dir"
-    ))?;
+    if !out_path.exists() {
+        create_dir(&args.arg_output_path).context(anyhow!(
+            "error creating output dir"
+        ))?;
+    }
 
     let fq = FastqManager::new(
         out_path, 
