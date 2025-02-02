@@ -7,7 +7,7 @@ use shardio::helper::ThreadProxyWriter;
 use shardio::SortKey;
 use shardio::{ShardReader, ShardWriter};
 use rust_htslib::bam::record::{Aux, Record};
-use rust_htslib::bam::{self, header, Read};
+use rust_htslib::bam::{self, Read};
 use regex::Regex;
 use itertools::Itertools;
 use anyhow::{Error, anyhow, Context};
@@ -25,7 +25,22 @@ mod rpcache;
 use bx_index::BxListIter;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const USAGE: &str = "Usage: cargo run --release <input>";
+const USAGE: &str = "
+BAM to FASTQ Converter for Single Cell RNA-seq Data.
+
+Usage:
+  bamtofastq [options] <bam> <output-dir>
+  bamtofastq -h | --help
+
+Options:
+  -h --help             Show help
+  --nthreads=N         CPU threads [default: 4]
+  --locus=L            Process specific region (chr:start-end)
+  --reads-per-fastq=N  Reads per FASTQ file [default: 100000000]
+  --relaxed            Skip unpaired or duplicated reads instead of throwing an error
+  --bx-list=FILE       Only include BX values listed in text file L. Requires BX-sorted and index BAM file
+  
+";
 
 type OutPaths = (
     PathBuf,
@@ -776,7 +791,7 @@ fn set_panic_handler() {
 }
 
 pub fn go(args: Args, cache_size: Option<usize>) -> Result<Vec<OutPaths>, Error> {
-    let cache_size = cache_size.unwrap_or(500_000);
+    let cache_size = cache_size.unwrap_or(100_000_000);
 
     let path = std::path::PathBuf::from(args.arg_bam.clone());
     if !path.exists() {
