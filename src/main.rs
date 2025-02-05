@@ -280,14 +280,14 @@ impl FormatBamRecords {
                     return Ok(());
                 }
                 let e = anyhow!(
-                    "BAM record missing tag: {:?} on read {:?}. You do not appear to have an original 10x BAM file.\nIf you downloaded this BAM file from SRA, you likely need to download the 'Original Format' version of the BAM available for most 10x datasets.",
+                    "BAM record missing tag: {:?} on read {:?}. You do not appear to have an original C4 BAM file.",
                     tag,
                     str::from_utf8(rec.qname()).unwrap()
                 );
                 return Err(e);
             }
             Ok(tag_val) => {
-                let e = anyhow!("Invalid BAM record: read: {:?} unexpected tag type. Expected string for {:?}, got {:?}.\n You do not appear to have the original 10x BAM file. If you downloaded this BAM file from SRA, you likely need to download the 'Original Format' version of the BAM available for most 10x datasets.", str::from_utf8(rec.qname()).unwrap(), tag, tag_val);
+                let e = anyhow!("Invalid BAM record: read: {:?} unexpected tag type. Expected string for {:?}, got {:?}.\n ", str::from_utf8(rec.qname()).unwrap(), tag, tag_val);
                 return Err(e);
             }
         }
@@ -1037,7 +1037,7 @@ fn main() {
     if let Err(ref e) = res {
         println!("bam2fastq error: {e}\n");
 
-        println!("If this error is unexpected. Please re-run with --traceback and include stack trace with an error report");
+        //println!("If this error is unexpected. Please re-run with --traceback and include stack trace with an error report");
 
         if traceback {
             println!("see below for more details:");
