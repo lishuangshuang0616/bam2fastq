@@ -976,7 +976,7 @@ where
         ncached += 1;
     }
     println!(
-        "Writing finished.  Observed {} unique read ids. Wrote {} read pairs ({} cached)",
+        "Writing finished. \nObserved {} unique read ids. \nWrote {} read pairs ({} cached)",
         total_read_pairs,
         fq.total_written(),
         ncached
@@ -1015,7 +1015,7 @@ where
 
     // make sure we have the right number of output reads
     println!(
-        "Writing finished.  Observed {} read pairs. Wrote {} read pairs",
+        "Writing finished. \nObserved {} read pairs. \nWrote {} read pairs",
         total_reads,
         fq.total_written()
     );
