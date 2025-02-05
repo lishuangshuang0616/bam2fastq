@@ -16,32 +16,12 @@ use std::fs::{create_dir, File};
 use std::panic;
 use std::path::Path;
 use std::str;
-use docopt::Docopt;
+use clap::Parser;
 
 mod bx_index;
 mod locus;
 mod rpcache;
-
 use bx_index::BxListIter;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const USAGE: &str = "
-BAM to FASTQ Converter for Single Cell RNA-seq Data.
-
-Usage:
-  bamtofastq [options] <bam> <output-path>
-  bamtofastq -h | --help
-
-Options:
-  -h --help             Show help
-  --nthreads=N         CPU threads [default: 4]
-  --locus=L            Process specific region (chr:start-end)
-  --reads-per-fastq=N  Reads per FASTQ file [default: 100000000]
-  --relaxed            Skip unpaired or duplicated reads instead of throwing an error
-  --bx-list=FILE       Only include BX values listed in text file L. Requires BX-sorted and index BAM file
-  --traceback          Print full traceback if an error occurs
-
-";
 
 type OutPaths = (
     PathBuf,
@@ -159,7 +139,7 @@ impl FormatBamRecords {
                 rg_items.insert(name.clone(), (name, 0));
             }
         }
-        println!("{:?}",rg_items);
+        //println!("{:?}",rg_items);
 
         rg_items
     }
@@ -748,16 +728,40 @@ impl FastqWriter {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about = "BAM to FASTQ Converter for C4 Single Cell RNA-seq Data", long_about = None)]
 pub struct Args {
-    arg_bam: String,
-    arg_output_path: String,
-    flag_nthreads: usize,
-    flag_locus: Option<String>,
-    flag_bx_list: Option<String>,
-    flag_reads_per_fastq: usize,
-    flag_traceback: bool,
-    flag_relaxed: bool,
+    /// Input BAM file path
+    #[arg(value_name = "bam", help = "Input BAM file path")]
+    bam: String,
+
+    /// Output directory for FASTQ files
+    #[arg(value_name = "outpath", help = "Output directory for FASTQ files")] 
+    outputpath: String,
+
+    /// Number of CPU threads to use
+    #[arg(short = 't', long, value_name = "nthreads", default_value = "4", help = "Number of CPU threads to use for processing")]
+    nthreads: usize,
+
+    /// Process specific genomic region
+    #[arg(short = 'r', long, value_name = "region", help = "Process specific genomic region (format: chr1:1000-2000)")]
+    locus: Option<String>,
+
+    /// BX tag list file (hidden option)
+    #[arg(long, hide = true)]
+    bx_list: Option<String>,
+
+    /// Number of reads per FASTQ file
+    #[arg(short = 'n', long, default_value = "100000000", value_name = "N", help = "Maximum number of reads to write per FASTQ file")]
+    reads_per_fastq: usize,
+
+    /// Show detailed error traceback
+    #[arg(long, hide = true)]
+    traceback: bool,
+
+    /// Relaxed mode for unpaired reads
+    #[arg(long, value_name = "relaxed",help = "Skip unpaired reads instead of throwing an error")]
+    relaxed: bool,
 }
 
 fn set_panic_handler() {
@@ -794,16 +798,16 @@ fn set_panic_handler() {
 pub fn go(args: Args, cache_size: Option<usize>) -> Result<Vec<OutPaths>, Error> {
     let cache_size = cache_size.unwrap_or(100_000_000);
 
-    let path = std::path::PathBuf::from(args.arg_bam.clone());
+    let path = std::path::PathBuf::from(args.bam.clone());
     if !path.exists() {
         return Err(anyhow!("BAM file doesn't exist: {:?}", path));
     }
 
-    match args.flag_locus {
+    match args.locus {
         Some(ref locus) => {
             let loc = locus::Locus::from_str(locus)
                 .context("Invalid locus argument. Please use format: 'chr1:123-456'")?;
-            let mut bam = bam::IndexedReader::from_path(&args.arg_bam)
+            let mut bam = bam::IndexedReader::from_path(&args.bam)
                 .context(
                     "Error opening BAM file. The BAM file must be indexed when using --locus",
                 )?;
@@ -816,7 +820,7 @@ pub fn go(args: Args, cache_size: Option<usize>) -> Result<Vec<OutPaths>, Error>
             inner(args.clone(), cache_size, bam)
         }
         None => {
-            let _bam = bam::Reader::from_path(&args.arg_bam);
+            let _bam = bam::Reader::from_path(&args.bam);
             let bam = _bam.context("Error opening BAM file")?;
             inner(args, cache_size, bam)
         }
@@ -828,15 +832,15 @@ pub fn inner<R: bam::Read>(
     cache_size: usize,
     mut bam: R,
 ) -> Result<Vec<OutPaths>, Error> {
-    bam.set_threads( args.flag_nthreads)?;
+    bam.set_threads( args.nthreads)?;
     let formatter = {
         FormatBamRecords::c4head(&bam)
     };
-    println!("{:?}", formatter);
+    //println!("{:?}", formatter);
 
-    let out_path = Path::new(&args.arg_output_path);
+    let out_path = Path::new(&args.outputpath);
     if !out_path.exists() {
-        create_dir(&args.arg_output_path).context(anyhow!(
+        create_dir(&args.outputpath).context(anyhow!(
             "error creating output dir"
         ))?;
     }
@@ -845,32 +849,32 @@ pub fn inner<R: bam::Read>(
         out_path, 
         formatter.clone(), 
         "bam2fastq".to_string(), 
-        args.flag_reads_per_fastq
+        args.reads_per_fastq
     );
 
     if formatter.is_double_ended() {
-        if args.flag_bx_list.is_some() {
-            let bxi = bx_index::BxIndex::new(args.arg_bam)?;
+        if args.bx_list.is_some() {
+            let bxi = bx_index::BxIndex::new(args.bam)?;
             let bx_iter = BxListIter::from_path(
-                args.flag_bx_list.unwrap(), 
+                args.bx_list.unwrap(), 
                 bxi, 
                 bam
             )?;
-            proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.flag_relaxed)
+            proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.relaxed)
         } else {
             proc_double_ended(
                 bam.records(),
                 formatter,
                 fq,
                 cache_size,
-                args.flag_locus.is_some(),
-                args.flag_relaxed,
+                args.locus.is_some(),
+                args.relaxed,
             )
         }
-    } else if args.flag_bx_list.is_some() {
-        let bxi = bx_index::BxIndex::new(args.arg_bam)?;
-        let bx_iter = BxListIter::from_path(args.flag_bx_list.unwrap(), bxi, bam)?;
-        proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.flag_relaxed)
+    } else if args.bx_list.is_some() {
+        let bxi = bx_index::BxIndex::new(args.bam)?;
+        let bx_iter = BxListIter::from_path(args.bx_list.unwrap(), bxi, bam)?;
+        proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.relaxed)
     } else {
         proc_single_ended(bam.records(), formatter, fq)
     }
@@ -1023,12 +1027,11 @@ fn main() {
     set_panic_handler();
     std::env::set_var("RUST_BACKTRACE", "1");
 
-    println!("bam2fastq v{}", VERSION);
-    let args: Args = Docopt::new(USAGE)
-        .and_then(|d| d.deserialize())
-        .unwrap_or_else(|e| e.exit());
+    //println!("bam2fastq v{}", VERSION);
+    // 使用 clap 解析命令行参数
+    let args = Args::parse();
 
-    let traceback = args.flag_traceback;
+    let traceback = args.traceback;
     let res = go(args, None);
 
     if let Err(ref e) = res {
@@ -1056,14 +1059,14 @@ mod tests {
         let output_dir = "target/fastq_results";
 
         let args = Args {
-            flag_nthreads: 10,
-            arg_bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
-            arg_output_path: output_dir.to_string(),
-            flag_reads_per_fastq: 100000000,
-            flag_locus: None,
-            flag_bx_list: None,
-            flag_traceback: false,
-            flag_relaxed: false,
+            nthreads: 10,
+            bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
+            outputpath: output_dir.to_string(),
+            reads_per_fastq: 100000000,
+            locus: None,
+            bx_list: None,
+            traceback: false,
+            relaxed: false,
         };
 
         // 运行转换
@@ -1103,14 +1106,14 @@ mod tests {
         let tmp_path = tempdir.path().join("outs");
 
         let args = Args {
-            flag_nthreads: 2,
-            arg_bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
-            arg_output_path: tmp_path.to_str().unwrap().to_string(),
-            flag_reads_per_fastq: 100000,
-            flag_locus: None,
-            flag_bx_list: None,
-            flag_traceback: false,
-            flag_relaxed: false,
+            nthreads: 2,
+            bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
+            outputpath: tmp_path.to_str().unwrap().to_string(),
+            reads_per_fastq: 100000,
+            locus: None,
+            bx_list: None,
+            traceback: false,
+            relaxed: false,
         };
 
         let res = super::go(args, Some(2));
