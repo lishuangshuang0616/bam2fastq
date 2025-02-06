@@ -1,4 +1,3 @@
-// Copyright (c) 2020 10x Genomics, Inc. All rights reserved.
 
 use rust_htslib::bam::record::Record;
 use std::collections::HashMap;

@@ -1,4 +1,3 @@
-// Copyright (c) 2020 10x Genomics, Inc. All rights reserved.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
