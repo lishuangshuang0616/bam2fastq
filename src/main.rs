@@ -134,8 +134,8 @@ impl FormatBamRecords {
             .collect::<HashMap<_, _>>();
 
         if rg_items.is_empty() {
-            for i in 1..2 {
-                let name = format!("result{:01}", i);
+            for _i in 1..2 {
+                let name = format!("bam2fastq_output");
                 rg_items.insert(name.clone(), (name, 0));
             }
         }
@@ -194,9 +194,9 @@ impl FormatBamRecords {
                 match parts.next() {
                     Some(v) => {
                         match u32::from_str(v) {
-                            Ok(v) => {
+                            Ok(_v) => {
                                 //println!("got gg: {}", v);
-                                let name = format!("result{:01}", v);
+                                let name = format!("bam2fastq_output");
                                 self.rg_spec.get(&name).cloned()
                             }
                             _ => None,
@@ -432,7 +432,7 @@ impl FastqManager {
         out_dir: &Path,
         formatter: FormatBamRecords,
         _sample_name: String,
-        reads_per_fastq: usize,
+        reads_per_fastq: Option<usize>,
     ) -> Self {
         let mut sample_def_paths = HashMap::new();
         let mut writers = HashMap::new();
@@ -512,7 +512,7 @@ struct FastqWriter {
     chunk_written: usize,
     total_written: usize,
     n_chunks: usize,
-    reads_per_fastq: usize,
+    reads_per_fastq: Option<usize>,
     path_sets: Vec<(PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>)>,
 }
 
@@ -522,7 +522,7 @@ impl FastqWriter {
         formatter: FormatBamRecords,
         sample_name: String,
         lane: u32,
-        reads_per_fastq: usize,
+        reads_per_fastq: Option<usize>,
     ) -> Self {
         Self {
             formatter,
@@ -694,8 +694,11 @@ impl FastqWriter {
         self.chunk_written += 1;
         self.total_written += 1;
 
-        if self.chunk_written == self.reads_per_fastq {
-            self.cycle_writers();
+        // 只有当reads_per_fastq有值时才进行分割
+        if let Some(max_reads) = self.reads_per_fastq {
+            if self.chunk_written == max_reads {
+                self.cycle_writers();
+            }
         }
         Ok(())
     }
@@ -709,12 +712,14 @@ impl FastqWriter {
             &self.formatter
         );
 
-        self.r1 = Some(Self::open_gzip_writer(paths.0));
-        self.r2 = Some(Self::open_gzip_writer(paths.1));
+        self.r1 = Some(Self::open_gzip_writer(&paths.0));
+        self.r2 = Some(Self::open_gzip_writer(&paths.1));
         self.i1 = paths.2.as_ref().map(Self::open_gzip_writer);
         self.i2 = paths.3.as_ref().map(Self::open_gzip_writer);
 
         self.n_chunks += 1;
+        self.chunk_written = 0;
+        self.path_sets.push(paths);
     }
 
     fn open_gzip_writer<P: AsRef<Path>>(
@@ -752,8 +757,8 @@ pub struct Args {
     bx_list: Option<String>,
 
     /// Number of reads per FASTQ file
-    #[arg(short = 'n', long, default_value = "100000000", value_name = "N", help = "Maximum number of reads to write per FASTQ file")]
-    reads_per_fastq: usize,
+    #[arg(short = 'n', long, value_name = "N", help = "Maximum number of reads to write per FASTQ file")]
+    reads_per_fastq: Option<usize>,
 
     /// Show detailed error traceback
     #[arg(long, hide = true)]
@@ -796,7 +801,7 @@ fn set_panic_handler() {
 }
 
 pub fn go(args: Args, cache_size: Option<usize>) -> Result<Vec<OutPaths>, Error> {
-    let cache_size = cache_size.unwrap_or(100_000_000);
+    let cache_size = cache_size.unwrap_or(500_000);
 
     let path = std::path::PathBuf::from(args.bam.clone());
     if !path.exists() {
@@ -903,7 +908,7 @@ where
             1 << 21
         )?;
         let mut sender = w.get_sender();
-        let mut totble_read_pairs = 0;
+        let mut totle_read_pairs = 0;
 
         for _rec in records {
             let rec = _rec.context("Error when reading BAM")?;
@@ -918,7 +923,7 @@ where
                 (true, true) => {
                     return Err(anyhow!("Read has both r1 and r2 flags: {}", str::from_utf8(rec.qname()).unwrap()))
                 }
-                (true, false) => totble_read_pairs += 1,
+                (true, false) => totle_read_pairs += 1,
                 (false, true) => (),
             }
 
@@ -945,7 +950,7 @@ where
             sender.send(ser)?;
         }
 
-        totble_read_pairs
+        totle_read_pairs
     };
 
     let reader = ShardReader::<SerFq, SerFqSort>::open(temp_file.path())?;
@@ -1062,7 +1067,7 @@ mod tests {
             nthreads: 10,
             bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             outputpath: output_dir.to_string(),
-            reads_per_fastq: 100000000,
+            reads_per_fastq: None,
             locus: None,
             bx_list: None,
             traceback: false,
@@ -1070,7 +1075,7 @@ mod tests {
         };
 
         // 运行转换
-        let out_path_sets = super::go(args, Some(1000000)).unwrap();
+        let out_path_sets = super::go(args, None).unwrap();
         
         // 打印结果文件路径
         println!("\n生成的FASTQ文件:");
@@ -1109,7 +1114,7 @@ mod tests {
             nthreads: 2,
             bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             outputpath: tmp_path.to_str().unwrap().to_string(),
-            reads_per_fastq: 100000,
+            reads_per_fastq: None,
             locus: None,
             bx_list: None,
             traceback: false,
