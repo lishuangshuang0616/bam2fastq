@@ -22,8 +22,12 @@ clap = {version = "4.5.0", features = ["derive"]}
 
 
 [profile.release]
-debug = 1
-lto = true
+opt-level = 'z'     # 优化大小而不是速度
+debug = 0           # 禁用调试信息
+lto = true         # 启用链接时优化
+codegen-units = 1  # 降低并行编译单元数以提高优化
+panic = 'abort'    # 移除 panic 展开代码
+strip = true       # 自动剥离符号信息
 
 [profile.dev]
 opt-level = 3
