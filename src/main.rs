@@ -734,22 +734,33 @@ impl FastqWriter {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "BAM to FASTQ Converter for C4 Single Cell RNA-seq Data", long_about = None)]
+#[command(author, version, about = "BAM to FASTQ Converter for C4 Single Cell RNA seq Data", long_about = None)]
 pub struct Args {
     /// Input BAM file path
-    #[arg(value_name = "bam", help = "Input BAM file path")]
+    #[arg(value_name = "BAM", help = "Path to the input BAM file")]
     bam: String,
 
     /// Output directory for FASTQ files
-    #[arg(value_name = "outpath", help = "Output directory for FASTQ files")] 
+    #[arg(value_name = "OUTPUT", help = "Directory where FASTQ files will be written")] 
     outputpath: String,
 
     /// Number of CPU threads to use
-    #[arg(short = 't', long, value_name = "nthreads", default_value = "4", help = "Number of CPU threads to use for processing")]
+    #[arg(
+        short = 't',
+        long,
+        value_name = "THREADS",
+        default_value = "4",
+        help = "Number of CPU threads for parallel processing"
+    )]
     nthreads: usize,
 
     /// Process specific genomic region
-    #[arg(short = 'r', long, value_name = "region", help = "Process specific genomic region (format: chr1:1000-2000)")]
+    #[arg(
+        short = 'r',
+        long,
+        value_name = "REGION",
+        help = "Process reads from a specific genomic region (format: chr1:1000-2000)"
+    )]
     locus: Option<String>,
 
     /// BX tag list file (hidden option)
@@ -757,7 +768,12 @@ pub struct Args {
     bx_list: Option<String>,
 
     /// Number of reads per FASTQ file
-    #[arg(short = 'n', long, value_name = "N", help = "Maximum number of reads to write per FASTQ file")]
+    #[arg(
+        short = 'n',
+        long,
+        value_name = "READS",
+        help = "Maximum number of reads per FASTQ file. When this limit is reached, a new file will be created. All reads go to a single file if not specified."
+    )]
     reads_per_fastq: Option<usize>,
 
     /// Show detailed error traceback
@@ -765,7 +781,12 @@ pub struct Args {
     traceback: bool,
 
     /// Relaxed mode for unpaired reads
-    #[arg(long, value_name = "relaxed",help = "Skip unpaired reads instead of throwing an error")]
+    #[arg(
+        long,
+        hide = true,
+        default_value_t = true,
+        help = "Skip unpaired reads instead of throwing an error"
+    )]
     relaxed: bool,
 }
 
