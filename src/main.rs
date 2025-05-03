@@ -772,7 +772,7 @@ pub struct Args {
         short = 'n',
         long,
         value_name = "READS",
-        help = "Maximum number of reads per FASTQ file. When this limit is reached, a new file will be created. All reads go to a single file if not specified."
+        help = "Maximum number of reads per FASTQ file. All reads go to a single file if not specified."
     )]
     reads_per_fastq: Option<usize>,
 
