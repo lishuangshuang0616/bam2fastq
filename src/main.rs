@@ -17,6 +17,7 @@ use std::panic;
 use std::path::Path;
 use std::str;
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 
 mod bx_index;
 mod locus;
@@ -919,6 +920,14 @@ where
     I: Iterator<Item = Result<Record, E>>,
     Result<Record, E>: Context<Record, E>,
 {
+    // 创建进度条
+    let progress_bar = ProgressBar::new_spinner();
+    progress_bar.set_style(ProgressStyle::default_spinner()
+        .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
+        .unwrap()
+        .progress_chars("#>-"));
+    progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    
     let temp_file = tempfile::NamedTempFile::new_in(&fq.out_dir)?;
     let total_read_pairs = {
         let mut rp_cache = RpCache::new(cache_size, relaxed);
@@ -930,11 +939,20 @@ where
         )?;
         let mut sender = w.get_sender();
         let mut totle_read_pairs = 0;
+        let mut processed_reads = 0;
 
         for _rec in records {
             let rec = _rec.context("Error when reading BAM")?;
             if rec.is_secondary() || rec.is_supplementary() {
                 continue;
+            }
+
+            processed_reads += 1;
+            
+            // 每处理1000条记录更新一次进度条
+            if processed_reads % 1000 == 0 {
+                progress_bar.set_position(processed_reads);
+                progress_bar.set_message(format!("Processing BAM records..."));
             }
 
             match (rec.is_first_in_template(), rec.is_last_in_template()) {
@@ -966,16 +984,27 @@ where
             }
         }
 
+        progress_bar.set_message("Processing orphaned reads...");
         for (_, orphan) in rp_cache.cache.drain() {
             let ser = formatter.bam_rec_to_ser(&orphan)?;
             sender.send(ser)?;
         }
 
+        progress_bar.finish_with_message(format!("Processed {} reads, found {} read pairs", processed_reads, totle_read_pairs));
         totle_read_pairs
     };
 
+    // 为第二阶段创建新的进度条
+    let write_progress = ProgressBar::new_spinner();
+    write_progress.set_style(ProgressStyle::default_spinner()
+        .template("{spinner:.blue} [{elapsed_precise}] Writing FASTQ files... {msg}")
+        .unwrap()
+        .progress_chars("#>-"));
+    write_progress.enable_steady_tick(std::time::Duration::from_millis(100));
+    
     let reader = ShardReader::<SerFq, SerFqSort>::open(temp_file.path())?;
     let mut ncached = 0;
+    
     for (_, items) in &reader
         .iter()?
         .chunk_by(|x| x.as_ref().ok().map(|x| x.header_key.clone()))
@@ -1000,7 +1029,15 @@ where
         let r2 = item_vec.swap_remove(0);
         fq.write(&r1.read_group, &r1.rec, &r2.rec, &r1.i1, &r1.i2);
         ncached += 1;
+        
+        // 每写入100条记录更新一次进度条
+        if ncached % 100 == 0 {
+            write_progress.set_message(format!("Written {} read pairs", ncached));
+        }
     }
+    
+    write_progress.finish_with_message(format!("Completed! Written {} read pairs", ncached));
+    
     println!(
         "Writing finished. \nObserved {} unique read ids. \nWrote {} read pairs ({} cached)",
         total_read_pairs,
@@ -1019,6 +1056,14 @@ fn proc_single_ended<I>(
 where
     I: Iterator<Item = Result<Record, rust_htslib::errors::Error>>,
 {
+    // 创建进度条
+    let progress_bar = ProgressBar::new_spinner();
+    progress_bar.set_style(ProgressStyle::default_spinner()
+        .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
+        .unwrap()
+        .progress_chars("#>-"));
+    progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
+    
     let total_reads = {
         // Count total R1s observed, so we can make sure we've preserved all read pairs
         let mut total_reads = 0;
@@ -1031,11 +1076,18 @@ where
             }
 
             total_reads += 1;
+            
+            // 每处理1000条记录更新一次进度条
+            if total_reads % 1000 == 0 {
+                progress_bar.set_position(total_reads);
+                progress_bar.set_message("Processing single-end reads...");
+            }
 
             let (rg, fq1, fq2, fq_i1, fq_i2) = formatter.format_read(&rec)?;
             fq.write(&rg, &fq1, &fq2, &fq_i1, &fq_i2);
         }
 
+        progress_bar.finish_with_message(format!("Processed {} reads", total_reads));
         total_reads
     };
 
