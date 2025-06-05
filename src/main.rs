@@ -727,9 +727,9 @@ impl FastqWriter {
         path: P
     ) -> ThreadProxyWriter<BufWriter<GzEncoder<File>>> {
         let file = File::create(path).unwrap();
-        let gz = GzEncoder::new(file, flate2::Compression::default());
+        let gz = GzEncoder::new(file, flate2::Compression::fast());
         ThreadProxyWriter::new(
-            BufWriter::with_capacity(1 << 22, gz), 1 << 19
+            BufWriter::with_capacity(1 << 24, gz), 1 << 21
         )
     }
 }
