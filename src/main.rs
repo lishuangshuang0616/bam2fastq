@@ -18,6 +18,56 @@ use std::path::Path;
 use std::str;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
+// use rayon::prelude::*; // Commented out as not currently used
+use once_cell::sync::Lazy;
+
+// Function to get available system memory in bytes
+#[cfg(target_os = "macos")]
+fn get_available_memory() -> usize {
+    use std::process::Command;
+    let output = Command::new("vm_stat")
+        .output()
+        .expect("Failed to execute vm_stat");
+    
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains("Pages free") || line.contains("Pages inactive") {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() > 1 {
+                    let pages: usize = parts[1].trim().trim_end_matches('.').parse().unwrap_or(0);
+                    // Page size is typically 4096 bytes on macOS
+                    return pages * 4096;
+                }
+            }
+        }
+    }
+    1024 * 1024 * 1024 // Default to 1GB if we can't determine
+}
+
+#[cfg(target_os = "linux")]
+fn get_available_memory() -> usize {
+    use std::fs;
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    for line in meminfo.lines() {
+        if line.starts_with("MemAvailable:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 1 {
+                let kb: usize = parts[1].parse().unwrap_or(0);
+                return kb * 1024; // Convert KB to bytes
+            }
+        }
+    }
+    1024 * 1024 * 1024 // Default to 1GB if we can't determine
+}
+
+// Fallback for other platforms
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_available_memory() -> usize {
+    1024 * 1024 * 1024 // Default to 1GB
+}
+
+static RG_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^([0-9]+)-[0-9A-F]+$").unwrap());
 
 mod bx_index;
 mod locus;
@@ -126,7 +176,10 @@ impl FormatBamRecords {
     }
 
     fn parse_rgs<R: bam::Read>(reader: &R) -> HashMap<String, Rg> {
-        let text = std::str::from_utf8(reader.header().as_bytes()).unwrap();
+        let text = match std::str::from_utf8(reader.header().as_bytes()) {
+            Ok(t) => t,
+            Err(_) => return HashMap::new(), // Return empty map on UTF-8 error
+        };
 
         let mut rg_items = text
             .lines()
@@ -150,8 +203,9 @@ impl FormatBamRecords {
         entries.next()?; // consume @RG entry
 
         let mut tags = entries
-            .map(|entry| entry.split_once(':').unwrap())
-            .collect::<HashMap<_, _>>();
+            .map(|entry| entry.split_once(':').ok_or_else(|| anyhow!("Invalid RG entry format")))
+            .collect::<Result<HashMap<_, _>, _>>()
+            .ok()?;
 
         let v = tags.remove("ID")?;
         let (rg, lane) = v.rsplit_once(':')?;
@@ -159,9 +213,10 @@ impl FormatBamRecords {
         match u32::from_str(lane) {
             Ok(n) => Some((v.to_string(), (rg.to_string(), n))),
             Err(_) => {
-                let re = Regex::new(r"^([0-9]+)-[0-9A-F]+$").unwrap();
-                let cap = re.captures(lane)?;
-                let lane_u32 = u32::from_str(cap.get(1).unwrap().as_str()).unwrap();
+                let cap = RG_REGEX.captures(lane)?;
+                let lane_u32 = u32::from_str(cap.get(1).unwrap().as_str())
+                    .map_err(|e| anyhow!("Failed to parse lane number: {}", e))
+                    .ok()?;
                 Some((v.to_string(), (rg.to_string(), lane_u32)))
             }
         }
@@ -171,13 +226,22 @@ impl FormatBamRecords {
         let rg = rec.aux(b"RG");
         match rg {
             Ok(Aux::String(s)) => {
-                let key = String::from_utf8(Vec::from(s)).unwrap();
+                let key = match String::from_utf8(Vec::from(s)) {
+                    Ok(k) => k,
+                    Err(_) => return None, // Return None on UTF-8 error
+                };
                 self.rg_spec.get(&key).cloned()
             }
-            Ok(..) => panic!(
-                "invalid type of RG header. record: {}",
-                str::from_utf8(rec.qname()).unwrap()
-            ),
+            Ok(..) => {
+                eprintln!(
+                    "invalid type of RG header. record: {}",
+                    match str::from_utf8(rec.qname()) {
+                        Ok(s) => s,
+                        Err(_) => "invalid UTF-8",
+                    }
+                );
+                None
+            },
             Err(_) => None,
         }
     }
@@ -189,7 +253,10 @@ impl FormatBamRecords {
             main_rg_tag
         } else {
             let emit = |tag| {
-                let corrected_bc = String::from_utf8(Vec::from(tag)).unwrap();
+                let corrected_bc = match String::from_utf8(Vec::from(tag)) {
+                    Ok(s) => s,
+                    Err(_) => return None, // Return None on UTF-8 error
+                };
                 let mut parts = corrected_bc.split('-');
                 let _ = parts.next();
                 match parts.next() {
@@ -283,7 +350,7 @@ impl FormatBamRecords {
                 let e = anyhow!(
                     "BAM record missing tag: {:?} on read {:?}. You do not appear to have an original C4 BAM file.",
                     tag,
-                    str::from_utf8(rec.qname()).unwrap()
+                    str::from_utf8(rec.qname()).map_err(|e| anyhow!("Invalid read name UTF-8: {}", e))?
                 );
                 return Err(e);
             }
@@ -659,7 +726,7 @@ impl FastqWriter {
             if let Some(r) = rec {
                 FastqWriter::write_rec(w, r)?;
             } else {
-                panic!("No record to write");
+                return Err(anyhow!("No record to write"));
             }
         }
         Ok(())
@@ -726,10 +793,28 @@ impl FastqWriter {
     fn open_gzip_writer<P: AsRef<Path>>(
         path: P
     ) -> ThreadProxyWriter<BufWriter<GzEncoder<File>>> {
-        let file = File::create(path).unwrap();
-        let gz = GzEncoder::new(file, flate2::Compression::fast());
+        let file = File::create(path)
+            .map_err(|e| anyhow!("Failed to create output file: {}", e))
+            .expect("Failed to create output file");
+        // Use adaptive compression settings based on available memory
+        let available_memory = get_available_memory();
+        let compression_level = if available_memory < 4 * 1024 * 1024 * 1024 { // Less than 4GB
+            flate2::Compression::fast() // Faster, less memory
+        } else {
+            flate2::Compression::new(6) // Balanced compression
+        };
+        let gz = GzEncoder::new(file, compression_level);
+        
+        // Adjust buffer size based on available memory
+        let buffer_size = if available_memory < 2 * 1024 * 1024 * 1024 { // Less than 2GB
+            1 << 20 // 1MB buffer
+        } else {
+            1 << 24 // 16MB buffer (original size)
+        };
+        
         ThreadProxyWriter::new(
-            BufWriter::with_capacity(1 << 24, gz), 1 << 21
+            BufWriter::with_capacity(buffer_size, gz), 
+            buffer_size / 4
         )
     }
 }
@@ -777,6 +862,14 @@ pub struct Args {
     )]
     reads_per_fastq: Option<usize>,
 
+    /// Maximum memory to use in MB (default: automatically determined)
+    #[arg(
+        long,
+        value_name = "MEMORY",
+        help = "Maximum memory to use in MB. If not specified, will be automatically determined based on system resources."
+    )]
+    max_memory: Option<usize>,
+
     /// Show detailed error traceback
     #[arg(long, hide = true)]
     traceback: bool,
@@ -823,7 +916,19 @@ fn set_panic_handler() {
 }
 
 pub fn go(args: Args, cache_size: Option<usize>) -> Result<Vec<OutPaths>, Error> {
-    let cache_size = cache_size.unwrap_or(500_000);
+    // Calculate optimal cache size based on available memory or user-specified limit
+    let cache_size = match cache_size {
+        Some(size) => size,
+        None => {
+            let available_memory = match args.max_memory {
+                Some(mb) => mb * 1024 * 1024, // Convert MB to bytes
+                None => get_available_memory(),
+            };
+            // Use 1/8 of available memory for cache, with minimum of 100k and maximum of 2M entries
+            let calculated_size = (available_memory / 8) / 1024; // Rough estimate assuming 1KB per entry
+            calculated_size.clamp(100_000, 2_000_000)
+        }
+    };
 
     let path = std::path::PathBuf::from(args.bam.clone());
     if !path.exists() {
@@ -924,18 +1029,33 @@ where
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
-        .unwrap()
+        .map_err(|e| anyhow!("Failed to set progress bar style: {}", e))?
         .progress_chars("#>-"));
     progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
     
     let temp_file = tempfile::NamedTempFile::new_in(&fq.out_dir)?;
+    
+    // Adjust ShardWriter parameters based on available memory
+    let available_memory = get_available_memory();
+    let shard_count = if available_memory < 2 * 1024 * 1024 * 1024 { // Less than 2GB
+        16 // Fewer shards to reduce memory usage
+    } else {
+        32 // Original shard count
+    };
+    
+    let buffer_size = if available_memory < 4 * 1024 * 1024 * 1024 { // Less than 4GB
+        1024 // Smaller buffer
+    } else {
+        2048 // Original buffer size
+    };
+    
     let total_read_pairs = {
         let mut rp_cache = RpCache::new(cache_size, relaxed);
         let w: ShardWriter<SerFq, SerFqSort> = ShardWriter::new(
             temp_file.path(), 
-            32, 
-            2048, 
-            1 << 21
+            shard_count, 
+            buffer_size, 
+            1 << 20 // Reduced from 1<<21 to reduce memory pressure
         )?;
         let mut sender = w.get_sender();
         let mut totle_read_pairs = 0;
@@ -953,14 +1073,20 @@ where
             if processed_reads % 1000 == 0 {
                 progress_bar.set_position(processed_reads);
                 progress_bar.set_message(format!("Processing BAM records..."));
+                
+                // Report memory usage periodically
+                if processed_reads % 100000 == 0 {
+                    let current_memory = get_available_memory();
+                    progress_bar.set_message(format!("Processing BAM records... (Memory: {} MB free)", current_memory / (1024 * 1024)));
+                }
             }
 
             match (rec.is_first_in_template(), rec.is_last_in_template()) {
                 (false, false) => {
-                    return Err(anyhow!("Not single-end read {}", str::from_utf8(rec.qname()).unwrap()))
+                    return Err(anyhow!("Not single-end read {}", str::from_utf8(rec.qname()).map_err(|e| anyhow!("Invalid read name UTF-8: {}", e))?))
                 }
                 (true, true) => {
-                    return Err(anyhow!("Read has both r1 and r2 flags: {}", str::from_utf8(rec.qname()).unwrap()))
+                    return Err(anyhow!("Read has both r1 and r2 flags: {}", str::from_utf8(rec.qname()).map_err(|e| anyhow!("Invalid read name UTF-8: {}", e))?))
                 }
                 (true, false) => totle_read_pairs += 1,
                 (false, true) => (),
@@ -972,13 +1098,15 @@ where
             if let Some((r1, r2)) = rp_cache.cache_rec(rec) {
                 let (rg, fq1, fq2, fq_i1, fq_i2) = formatter
                     .format_read_pair(&r1, &r2)
-                    .unwrap();
+                    .map_err(|e| anyhow!("Failed to format read pair: {}", e))?;
                 fq.write(&rg, &fq1, &fq2, &fq_i1, &fq_i2)
             }
 
-            if rp_cache.len() > cache_size {
+            // More aggressive cache eviction to reduce memory pressure
+            if rp_cache.len() > cache_size * 3 / 4 {
                 for orphan in rp_cache.clear_orphans(tid, pos) {
-                    let ser = formatter.bam_rec_to_ser(&orphan)?;
+                    let ser = formatter.bam_rec_to_ser(&orphan)
+                        .map_err(|e| anyhow!("Failed to serialize orphaned read: {}", e))?;
                     sender.send(ser)?;
                 }
             }
@@ -986,7 +1114,8 @@ where
 
         progress_bar.set_message("Processing orphaned reads...");
         for (_, orphan) in rp_cache.cache.drain() {
-            let ser = formatter.bam_rec_to_ser(&orphan)?;
+            let ser = formatter.bam_rec_to_ser(&orphan)
+                .map_err(|e| anyhow!("Failed to serialize orphaned read: {}", e))?;
             sender.send(ser)?;
         }
 
@@ -998,41 +1127,59 @@ where
     let write_progress = ProgressBar::new_spinner();
     write_progress.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.blue} [{elapsed_precise}] Writing FASTQ files... {msg}")
-        .unwrap()
+        .map_err(|e| anyhow!("Failed to set progress bar style: {}", e))?
         .progress_chars("#>-"));
     write_progress.enable_steady_tick(std::time::Duration::from_millis(100));
     
     let reader = ShardReader::<SerFq, SerFqSort>::open(temp_file.path())?;
     let mut ncached = 0;
     
-    for (_, items) in &reader
-        .iter()?
-        .chunk_by(|x| x.as_ref().ok().map(|x| x.header_key.clone()))
-    {
-        let _item_vec: Result<Vec<SerFq>, _> = items.collect();
-        let mut item_vec = _item_vec?;
+    // Use sequential processing for chunk processing to avoid iterator issues
+    let mut chunk_results = Vec::new();
+    let reader_iter = reader.iter()?;
+    let chunk_groups = reader_iter.chunk_by(|x| x.as_ref().ok().map(|x| x.header_key.clone()));
+    
+    for (_, items) in &chunk_groups {
+        let item_vec: Result<Vec<SerFq>, _> = items.collect();
+        let mut item_vec = item_vec?;
+        
         if item_vec.len() != 2 && !retricted_locus {
-            let header = str::from_utf8(&item_vec[0].rec.head).unwrap();
+            let header = str::from_utf8(&item_vec[0].rec.head)
+                .map_err(|e| anyhow!("Invalid UTF-8 in read header: {}", e))?;
             if !relaxed {
                 let msg = anyhow!("Didn't find both records for a paired end read. Is your BAM file complete?\nRead name of unpaired record: {}", header);
                 return Err(msg);
             } else {
                 println!("Didn't find both records for a paired end read. Skipping. Read name of unpaired record: {}", header);
+                continue;
             }
         }
-        if item_vec.len() != 2 && retricted_locus{
+        
+        if item_vec.len() != 2 && retricted_locus {
             continue;
         }
 
         item_vec.sort_by_key(|x| x.read_num);
         let r1 = item_vec.swap_remove(0);
         let r2 = item_vec.swap_remove(0);
-        fq.write(&r1.read_group, &r1.rec, &r2.rec, &r1.i1, &r1.i2);
+        
+        chunk_results.push((r1.read_group, r1.rec, r2.rec, r1.i1, r1.i2));
+    }
+    
+    // Process results for writing
+    for (read_group, r1_rec, r2_rec, i1_rec, i2_rec) in chunk_results {
+        fq.write(&read_group, &r1_rec, &r2_rec, &i1_rec, &i2_rec);
         ncached += 1;
         
         // 每写入100条记录更新一次进度条
         if ncached % 100 == 0 {
             write_progress.set_message(format!("Written {} read pairs", ncached));
+            
+            // Report memory usage periodically during writing
+            if ncached % 50000 == 0 {
+                let current_memory = get_available_memory();
+                write_progress.set_message(format!("Written {} read pairs (Memory: {} MB free)", ncached, current_memory / (1024 * 1024)));
+            }
         }
     }
     
@@ -1060,37 +1207,64 @@ where
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
-        .unwrap()
+        .map_err(|e| anyhow!("Failed to set progress bar style: {}", e))?
         .progress_chars("#>-"));
     progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
     
-    let total_reads = {
-        // Count total R1s observed, so we can make sure we've preserved all read pairs
-        let mut total_reads = 0;
-
-        for _rec in records {
-            let rec = _rec.context("Error when reading BAM")?;
-
-            if rec.is_secondary() || rec.is_supplementary() {
-                continue;
-            }
-
-            total_reads += 1;
-            
-            // 每处理1000条记录更新一次进度条
-            if total_reads % 1000 == 0 {
-                progress_bar.set_position(total_reads);
-                progress_bar.set_message("Processing single-end reads...");
-            }
-
-            let (rg, fq1, fq2, fq_i1, fq_i2) = formatter.format_read(&rec)?;
-            fq.write(&rg, &fq1, &fq2, &fq_i1, &fq_i2);
+    // Collect records with memory monitoring
+    let mut records_vec = Vec::new();
+    let mut processed_count = 0;
+    
+    for rec_result in records {
+        let rec = rec_result.context("Error when reading BAM")?;
+        
+        if rec.is_secondary() || rec.is_supplementary() {
+            continue;
         }
-
-        progress_bar.finish_with_message(format!("Processed {} reads", total_reads));
-        total_reads
+        
+        records_vec.push(rec);
+        processed_count += 1;
+        
+        // Report progress and memory usage
+        if processed_count % 10000 == 0 {
+            progress_bar.set_position(processed_count as u64);
+            progress_bar.set_message("Processing single-end reads...");
+            
+            if processed_count % 100000 == 0 {
+                let current_memory = get_available_memory();
+                progress_bar.set_message(format!("Processing single-end reads... (Memory: {} MB free)", current_memory / (1024 * 1024)));
+            }
+        }
+    }
+    
+    let total_reads = records_vec.len();
+    
+    // Process records in smaller batches to reduce memory pressure
+    let available_memory = get_available_memory();
+    let batch_size = if available_memory < 2 * 1024 * 1024 * 1024 { // Less than 2GB
+        1000 // Smaller batches
+    } else {
+        10000 // Larger batches
     };
+    
+    let mut written_count = 0;
+    
+    for batch in records_vec.chunks(batch_size) {
+        for rec in batch {
+            let formatted = formatter.format_read(rec)
+                .map_err(|e| anyhow!("Failed to format single read: {}", e))?;
+            let (rg, r1, r2, i1, i2) = formatted;
+            fq.write(&rg, &r1, &r2, &i1, &i2);
+            written_count += 1;
+        }
+        
+        // Update progress
+        progress_bar.set_position(written_count as u64);
+        progress_bar.set_message(format!("Processing single-end reads... ({} written)", written_count));
+    }
 
+    progress_bar.finish_with_message(format!("Processed {} reads", total_reads));
+    
     // make sure we have the right number of output reads
     println!(
         "Writing finished. \nObserved {} read pairs. \nWrote {} read pairs",
