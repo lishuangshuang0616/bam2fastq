@@ -753,7 +753,7 @@ pub struct Args {
         default_value = "4",
         help = "Number of CPU threads for parallel processing"
     )]
-    nthreads: usize,
+    threads: usize,
 
     /// Process specific genomic region
     #[arg(
@@ -859,7 +859,7 @@ pub fn inner<R: bam::Read>(
     cache_size: usize,
     mut bam: R,
 ) -> Result<Vec<OutPaths>, Error> {
-    bam.set_threads( args.nthreads)?;
+    bam.set_threads( args.threads)?;
     let formatter = {
         FormatBamRecords::c4head(&bam)
     };
@@ -1137,7 +1137,7 @@ mod tests {
         let output_dir = "target/fastq_results";
 
         let args = Args {
-            nthreads: 10,
+            threads: 10,
             bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             outputpath: output_dir.to_string(),
             reads_per_fastq: None,
@@ -1184,7 +1184,7 @@ mod tests {
         let tmp_path = tempdir.path().join("outs");
 
         let args = Args {
-            nthreads: 2,
+            threads: 2,
             bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             outputpath: tmp_path.to_str().unwrap().to_string(),
             reads_per_fastq: None,
