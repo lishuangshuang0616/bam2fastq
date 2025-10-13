@@ -160,6 +160,73 @@ pub fn complement(b: u8) -> u8 {
 
 impl FormatBamRecords {
 
+    /// Automatically detect if BAM contains paired-end reads by sampling records
+    pub fn detect_paired_end<R: bam::Read>(reader: &mut R) -> Result<bool, Error> {
+        let mut paired_count = 0;
+        let mut total_count = 0;
+        let max_samples = 100_000; // Sample up to 1000 reads for detection
+        
+        for result in reader.records() {
+            let record = result.context("Failed to read BAM record")?;
+            total_count += 1;
+            
+            // Check if read is paired (flag 0x1) and properly paired (flag 0x2)
+            if record.is_paired() {
+                paired_count += 1;
+            }
+            
+            // Stop sampling after enough records
+            if total_count >= max_samples {
+                break;
+            }
+        }
+        
+        // Consider paired-end if more than 50% of sampled reads are paired
+        let paired_ratio = if total_count > 0 {
+            paired_count as f64 / total_count as f64
+        } else {
+            0.0
+        };
+        
+        Ok(paired_ratio > 0.5)
+    }
+
+    /// Create C4 configuration with automatic paired-end detection
+    pub fn c4head_auto<R: bam::Read>(reader: &mut R) -> Result<FormatBamRecords, Error> {
+        let is_paired = Self::detect_paired_end(reader)?;
+        
+        if is_paired {
+            // For true paired-end data, both R1 and R2 contain read sequences
+            Ok(FormatBamRecords {
+                rg_spec: Self::parse_rgs(reader),
+                r1_spec: vec![
+                    SpecEntry::Tags("CR".to_string(), "CY".to_string()),
+                    SpecEntry::Tags("UR".to_string(), "UY".to_string()),
+                    SpecEntry::Read  // Include read sequence for R1
+                ],
+                r2_spec: vec![SpecEntry::Read],
+                i1_spec: vec![],
+                i2_spec: vec![],
+                rename: None,
+                order: [1, 2, 0, 0],
+            })
+        } else {
+            // For single-end data, only R2 contains read sequence
+            Ok(FormatBamRecords {
+                rg_spec: Self::parse_rgs(reader),
+                r1_spec: vec![
+                    SpecEntry::Tags("CR".to_string(), "CY".to_string()),
+                    SpecEntry::Tags("UR".to_string(), "UY".to_string())
+                ],
+                r2_spec: vec![SpecEntry::Read],
+                i1_spec: vec![],
+                i2_spec: vec![],
+                rename: None,
+                order: [1, 2, 0, 0],
+            })
+        }
+    }
+
     pub fn c4head<R: bam::Read>(reader: &R) -> FormatBamRecords {
         FormatBamRecords {
             rg_spec: Self::parse_rgs(reader),
@@ -372,13 +439,13 @@ impl FormatBamRecords {
     ) -> Result<FqRecord, Error> {
         let mut head = Vec::new();
         let qname = rec.qname();
-        // 找到斜杠的位置（如果存在）
+                // Find the position of the slash (if it exists)
         let base_name = if let Some(pos) = qname.iter().position(|&x| x == b'/') {
             &qname[..pos]
         } else {
             qname
         };
-        // 构建新的 header
+        // Construct the new header
         head.extend_from_slice(base_name);
         let head_suffix = format!("/{}", read_number);
         head.extend(head_suffix.as_bytes());
@@ -544,7 +611,7 @@ impl FastqManager {
                 }
             },
             None => {
-                // 如果没有 RG，使用第一个可用的 writer
+                                // If there is no RG, use the first available writer
                 if let Some(w) = self.writers.values_mut().next() {
                     w.write(r1, r2, i1, i2).expect("Failed to write records");
                 }
@@ -762,7 +829,7 @@ impl FastqWriter {
         self.chunk_written += 1;
         self.total_written += 1;
 
-        // 只有当reads_per_fastq有值时才进行分割
+                // Only split if reads_per_fastq is specified
         if let Some(max_reads) = self.reads_per_fastq {
             if self.chunk_written == max_reads {
                 self.cycle_writers();
@@ -882,6 +949,15 @@ pub struct Args {
         help = "Skip unpaired reads instead of throwing an error"
     )]
     relaxed: bool,
+
+    /// Automatically detect if BAM contains paired-end reads
+    #[arg(
+        long,
+        hide = true,
+        default_value_t = true,
+        help = "Automatically detect if BAM contains paired-end reads based on BAM flags"
+    )]
+    auto_detect: bool,
 }
 
 fn set_panic_handler() {
@@ -964,11 +1040,23 @@ pub fn inner<R: bam::Read>(
     cache_size: usize,
     mut bam: R,
 ) -> Result<Vec<OutPaths>, Error> {
-    bam.set_threads( args.threads)?;
-    let formatter = {
+    bam.set_threads(args.threads)?;
+    
+    let formatter = if args.auto_detect {
+        // For auto-detection, we need to create a separate reader to sample the BAM
+        // Since we can't easily clone the reader, we'll open the file again for detection
+        let mut detection_bam = bam::Reader::from_path(&args.bam)
+            .context("Failed to open BAM file for auto-detection")?;
+        
+        println!("Auto-detecting paired-end status from BAM file...");
+        let detected_formatter = FormatBamRecords::c4head_auto(&mut detection_bam)?;
+        let is_paired = detected_formatter.is_double_ended();
+        println!("Detected: {} data", if is_paired { "paired-end" } else { "single-end" });
+        
+        detected_formatter
+    } else {
         FormatBamRecords::c4head(&bam)
     };
-    //println!("{:?}", formatter);
 
     let out_path = Path::new(&args.outputpath);
     if !out_path.exists() {
@@ -1025,7 +1113,7 @@ where
     I: Iterator<Item = Result<Record, E>>,
     Result<Record, E>: Context<Record, E>,
 {
-    // 创建进度条
+        // Create progress bar
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
@@ -1069,7 +1157,7 @@ where
 
             processed_reads += 1;
             
-            // 每处理1000条记录更新一次进度条
+                        // Update progress bar every 1000 records
             if processed_reads % 1000 == 0 {
                 progress_bar.set_position(processed_reads);
                 progress_bar.set_message(format!("Processing BAM records..."));
@@ -1123,7 +1211,7 @@ where
         totle_read_pairs
     };
 
-    // 为第二阶段创建新的进度条
+        // Create new progress bar for the second stage
     let write_progress = ProgressBar::new_spinner();
     write_progress.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.blue} [{elapsed_precise}] Writing FASTQ files... {msg}")
@@ -1171,7 +1259,7 @@ where
         fq.write(&read_group, &r1_rec, &r2_rec, &i1_rec, &i2_rec);
         ncached += 1;
         
-        // 每写入100条记录更新一次进度条
+                // Update progress bar every 100 records written
         if ncached % 100 == 0 {
             write_progress.set_message(format!("Written {} read pairs", ncached));
             
@@ -1203,7 +1291,7 @@ fn proc_single_ended<I>(
 where
     I: Iterator<Item = Result<Record, rust_htslib::errors::Error>>,
 {
-    // 创建进度条
+        // Create progress bar
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
@@ -1280,7 +1368,7 @@ fn main() {
     std::env::set_var("RUST_BACKTRACE", "1");
 
     //println!("bam2fastq v{}", VERSION);
-    // 使用 clap 解析命令行参数
+        // Use clap to parse command line arguments
     let args = Args::parse();
 
     let traceback = args.traceback;
@@ -1305,27 +1393,29 @@ fn main() {
 mod tests {
     use super::*;
 
-    #[test]
+        #[test]
     fn test_lr21() {
-        // 创建固定的输出目录
+        // Create a fixed output directory
         let output_dir = "target/fastq_results";
 
         let args = Args {
             threads: 10,
-            bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
+            bam: "/Volumes/mac_up/anno_decon_sorted.bam".to_string(),
             outputpath: output_dir.to_string(),
             reads_per_fastq: None,
             locus: None,
             bx_list: None,
             traceback: false,
             relaxed: false,
+            max_memory: None,
+            auto_detect: true,
         };
 
-        // 运行转换
+                // Run conversion
         let out_path_sets = super::go(args, None).unwrap();
         
-        // 打印结果文件路径
-        println!("\n生成的FASTQ文件:");
+                // Print result file paths
+        println!("\nGenerated FASTQ files:");
         for (r1, r2, i1, i2) in out_path_sets {
             println!("R1: {}", r1.display());
             println!("R2: {}", r2.display());
@@ -1338,8 +1428,8 @@ mod tests {
             println!("---");
         }
 
-        // 可选:检查文件是否生成并打印文件大小
-        println!("\n文件大小信息:");
+                // Optional: Check if files are generated and print file sizes
+        println!("\nFile size information:");
         for entry in std::fs::read_dir(output_dir).unwrap() {
             let entry = entry.unwrap();
             let metadata = entry.metadata().unwrap();
@@ -1366,6 +1456,8 @@ mod tests {
             bx_list: None,
             traceback: false,
             relaxed: false,
+            max_memory: None,
+            auto_detect: true,
         };
 
         let res = super::go(args, Some(2));
