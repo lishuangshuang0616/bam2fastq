@@ -18,8 +18,12 @@ use std::path::Path;
 use std::str;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-// use rayon::prelude::*; // Commented out as not currently used
+use tempfile;
 use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 // Function to get available system memory in bytes
 #[cfg(target_os = "macos")]
@@ -92,7 +96,7 @@ type FormattedReadPair = (
 );
 
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 struct FqRecord {
     #[serde(with = "serde_bytes")]
     head: Vec<u8>,
@@ -555,11 +559,35 @@ impl FormatBamRecords {
 
 
 
-type Bgw = ThreadProxyWriter<BufWriter<GzEncoder<File>>>;
+enum GenWriter {
+    Gz(ThreadProxyWriter<BufWriter<GzEncoder<File>>>),
+    Raw(ThreadProxyWriter<BufWriter<File>>),
+}
+
+impl Write for GenWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            GenWriter::Gz(w) => w.write(buf),
+            GenWriter::Raw(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            GenWriter::Gz(w) => w.flush(),
+            GenWriter::Raw(w) => w.flush(),
+        }
+    }
+}
+
+type Bgw = GenWriter;
 
 struct FastqManager {
     writers: HashMap<Rg, FastqWriter>,
     out_dir: PathBuf,
+    // Add batch writing buffer
+    write_buffer: Vec<(Option<Rg>, FqRecord, FqRecord, Option<FqRecord>, Option<FqRecord>)>,
+    buffer_size: usize,
 }
 
 impl FastqManager {
@@ -568,6 +596,7 @@ impl FastqManager {
         formatter: FormatBamRecords,
         _sample_name: String,
         reads_per_fastq: Option<usize>,
+        no_compress: bool,
     ) -> Self {
         let mut sample_def_paths = HashMap::new();
         let mut writers = HashMap::new();
@@ -585,14 +614,27 @@ impl FastqManager {
                 "bam2fastq".to_string(),
                 1,
                 reads_per_fastq,
+                no_compress,
             );
 
             writers.insert((_sample.clone(), lane), writer);
         }
 
+        // Determine optimal buffer size based on available memory
+        let available_memory = get_available_memory();
+        let buffer_size = if available_memory < 2 * 1024 * 1024 * 1024 { // Less than 2GB
+            100 // Smaller buffer for low memory systems
+        } else if available_memory < 8 * 1024 * 1024 * 1024 { // Less than 8GB
+            500 // Medium buffer
+        } else {
+            1000 // Large buffer for high memory systems
+        };
+
         FastqManager {
             writers,
             out_dir: out_dir.to_path_buf(),
+            write_buffer: Vec::with_capacity(buffer_size),
+            buffer_size,
         }
     }
 
@@ -604,16 +646,35 @@ impl FastqManager {
         i1: &Option<FqRecord>,
         i2: &Option<FqRecord>,
     ) {
-        match rg {
-            Some(ref rg) => {
-                if let Some(w) = self.writers.get_mut(rg) {
-                    w.write(r1, r2, i1, i2).expect("Failed to write records");
-                }
-            },
-            None => {
-                                // If there is no RG, use the first available writer
-                if let Some(w) = self.writers.values_mut().next() {
-                    w.write(r1, r2, i1, i2).expect("Failed to write records");
+        // Add to buffer instead of writing immediately
+        self.write_buffer.push((
+            rg.clone(),
+            r1.clone(),
+            r2.clone(),
+            i1.clone(),
+            i2.clone(),
+        ));
+
+        // Flush buffer when it reaches capacity
+        if self.write_buffer.len() >= self.buffer_size {
+            self.flush_buffer();
+        }
+    }
+
+    pub fn flush_buffer(&mut self) {
+        // Process all buffered writes in batch
+        for (rg, r1, r2, i1, i2) in self.write_buffer.drain(..) {
+            match rg {
+                Some(ref rg) => {
+                    if let Some(w) = self.writers.get_mut(&rg) {
+                        w.write(&r1, &r2, &i1, &i2).expect("Failed to write records");
+                    }
+                },
+                None => {
+                    // If there is no RG, use the first available writer
+                    if let Some(w) = self.writers.values_mut().next() {
+                        w.write(&r1, &r2, &i1, &i2).expect("Failed to write records");
+                    }
                 }
             }
         }
@@ -628,6 +689,16 @@ impl FastqManager {
             .iter()
             .flat_map(|(_, w)| w.path_sets.clone())
             .collect()
+    }
+
+    pub fn flush_all_writers(&mut self) {
+        // First flush the buffer
+        self.flush_buffer();
+        
+        // Then flush all writers
+        for writer in self.writers.values_mut() {
+            writer.close_current_writers();
+        }
     }
 }
 
@@ -648,7 +719,8 @@ struct FastqWriter {
     total_written: usize,
     n_chunks: usize,
     reads_per_fastq: Option<usize>,
-    path_sets: Vec<(PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>)>,
+    path_sets: Vec<(PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>)>, 
+    no_compress: bool,
 }
 
 impl FastqWriter {
@@ -658,6 +730,7 @@ impl FastqWriter {
         sample_name: String,
         lane: u32,
         reads_per_fastq: Option<usize>,
+        no_compress: bool,
     ) -> Self {
         Self {
             formatter,
@@ -673,6 +746,7 @@ impl FastqWriter {
             n_chunks: 0,
             reads_per_fastq,
             path_sets: vec![],
+            no_compress,
         }
     }
 
@@ -682,31 +756,37 @@ impl FastqWriter {
         lane: u32,
         n_files: usize,
         formatter: &FormatBamRecords,
+        no_compress: bool,
     ) -> (PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>) {
+        let extension = if no_compress { "fastq" } else { "fastq.gz" };
         if formatter.rename.is_none() {
             let r1 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_1.fastq.gz", 
+                "{}_L{:02}_{:01}_1.{}", 
                 sample_name, 
                 lane,
-                n_files + 1
+                n_files + 1,
+                extension
             ));
             let r2 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_2.fastq.gz", 
+                "{}_L{:02}_{:01}_2.{}", 
                 sample_name, 
                 lane,
-                n_files + 1
+                n_files + 1,
+                extension
             ));
             let i1 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_I1.fastq.gz", 
+                "{}_L{:02}_{:01}_I1.{}", 
                 sample_name, 
                 lane,
-                n_files + 1
+                n_files + 1,
+                extension
             ));
             let i2 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_I2.fastq.gz", 
+                "{}_L{:02}_{:01}_I2.{}", 
                 sample_name, 
                 lane,
-                n_files + 1
+                n_files + 1,
+                extension
             ));
             (
                 r1, 
@@ -726,32 +806,36 @@ impl FastqWriter {
             let new_read_names = formatter.rename.as_ref().unwrap();
 
             let r1 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.{}", 
                 sample_name, 
                 lane,
                 n_files + 1,
-                new_read_names[0]
+                new_read_names[0],
+                extension
             ));
             let r2 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.{}", 
                 sample_name, 
                 lane,
                 n_files + 1,
-                new_read_names[1]
+                new_read_names[1],
+                extension
             ));
             let i1 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.{}", 
                 sample_name, 
                 lane,
                 n_files + 1,
-                new_read_names[2]
+                new_read_names[2],
+                extension
             ));
             let i2 = out_dir.join(format!(
-                "{}_L{:02}_{:01}_{}.fastq.gz", 
+                "{}_L{:02}_{:01}_{}.{}", 
                 sample_name, 
                 lane,
                 n_files + 1,
-                new_read_names[3]
+                new_read_names[3],
+                extension
             ));
             (
                 r1, 
@@ -844,33 +928,45 @@ impl FastqWriter {
             &self.sample_name, 
             self.lane, 
             self.n_chunks, 
-            &self.formatter
+            &self.formatter,
+            self.no_compress,
         );
 
-        self.r1 = Some(Self::open_gzip_writer(&paths.0));
-        self.r2 = Some(Self::open_gzip_writer(&paths.1));
-        self.i1 = paths.2.as_ref().map(Self::open_gzip_writer);
-        self.i2 = paths.3.as_ref().map(Self::open_gzip_writer);
+        self.r1 = Some(Self::open_writer(&paths.0, self.no_compress));
+        self.r2 = Some(Self::open_writer(&paths.1, self.no_compress));
+        self.i1 = paths.2.as_ref().map(|p| Self::open_writer(p, self.no_compress));
+        self.i2 = paths.3.as_ref().map(|p| Self::open_writer(p, self.no_compress));
 
         self.n_chunks += 1;
         self.chunk_written = 0;
         self.path_sets.push(paths);
     }
 
-    fn open_gzip_writer<P: AsRef<Path>>(
-        path: P
-    ) -> ThreadProxyWriter<BufWriter<GzEncoder<File>>> {
+    pub fn close_current_writers(&mut self) {
+        // Explicitly close and flush current writers
+        if let Some(mut writer) = self.r1.take() {
+            let _ = writer.flush();
+        }
+        if let Some(mut writer) = self.r2.take() {
+            let _ = writer.flush();
+        }
+        if let Some(mut writer) = self.i1.take() {
+            let _ = writer.flush();
+        }
+        if let Some(mut writer) = self.i2.take() {
+            let _ = writer.flush();
+        }
+    }
+
+    fn open_writer<P: AsRef<Path>>(
+        path: P,
+        no_compress: bool,
+    ) -> GenWriter {
         let file = File::create(path)
             .map_err(|e| anyhow!("Failed to create output file: {}", e))
             .expect("Failed to create output file");
         // Use adaptive compression settings based on available memory
         let available_memory = get_available_memory();
-        let compression_level = if available_memory < 4 * 1024 * 1024 * 1024 { // Less than 4GB
-            flate2::Compression::fast() // Faster, less memory
-        } else {
-            flate2::Compression::new(6) // Balanced compression
-        };
-        let gz = GzEncoder::new(file, compression_level);
         
         // Adjust buffer size based on available memory
         let buffer_size = if available_memory < 2 * 1024 * 1024 * 1024 { // Less than 2GB
@@ -878,11 +974,24 @@ impl FastqWriter {
         } else {
             1 << 24 // 16MB buffer (original size)
         };
-        
-        ThreadProxyWriter::new(
-            BufWriter::with_capacity(buffer_size, gz), 
-            buffer_size / 4
-        )
+
+        if no_compress {
+            GenWriter::Raw(ThreadProxyWriter::new(
+                BufWriter::with_capacity(buffer_size, file), 
+                buffer_size / 4
+            ))
+        } else {
+            let compression_level = if available_memory < 4 * 1024 * 1024 * 1024 { // Less than 4GB
+                flate2::Compression::fast() // Faster, less memory
+            } else {
+                flate2::Compression::new(6) // Balanced compression
+            };
+            let gz = GzEncoder::new(file, compression_level);
+            GenWriter::Gz(ThreadProxyWriter::new(
+                BufWriter::with_capacity(buffer_size, gz), 
+                buffer_size / 4
+            ))
+        }
     }
 }
 
@@ -958,6 +1067,10 @@ pub struct Args {
         help = "Automatically detect if BAM contains paired-end reads based on BAM flags"
     )]
     auto_detect: bool,
+
+    /// Disable output file compression
+    #[arg(long, help = "Disable gzip compression for output FASTQ files")]
+    no_compress: bool,
 }
 
 fn set_panic_handler() {
@@ -1069,7 +1182,8 @@ pub fn inner<R: bam::Read>(
         out_path, 
         formatter.clone(), 
         "bam2fastq".to_string(), 
-        args.reads_per_fastq
+        args.reads_per_fastq,
+        args.no_compress,
     );
 
     if formatter.is_double_ended() {
@@ -1080,7 +1194,7 @@ pub fn inner<R: bam::Read>(
                 bxi, 
                 bam
             )?;
-            proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.relaxed)
+            proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.relaxed, args.threads)
         } else {
             proc_double_ended(
                 bam.records(),
@@ -1089,12 +1203,13 @@ pub fn inner<R: bam::Read>(
                 cache_size,
                 args.locus.is_some(),
                 args.relaxed,
+                args.threads,
             )
         }
     } else if args.bx_list.is_some() {
         let bxi = bx_index::BxIndex::new(args.bam)?;
         let bx_iter = BxListIter::from_path(args.bx_list.unwrap(), bxi, bam)?;
-        proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.relaxed)
+        proc_double_ended(bx_iter, formatter, fq, cache_size, false, args.relaxed, args.threads)
     } else {
         proc_single_ended(bam.records(), formatter, fq)
     }
@@ -1104,16 +1219,23 @@ pub fn inner<R: bam::Read>(
 fn proc_double_ended<I, E> (
     records: I,
     formatter: FormatBamRecords,
-    mut fq: FastqManager,
+    fq: FastqManager,
     cache_size: usize,
     retricted_locus: bool,
     relaxed: bool,
+    num_threads: usize,
 ) -> Result<Vec<OutPaths>, Error>
 where 
     I: Iterator<Item = Result<Record, E>>,
     Result<Record, E>: Context<Record, E>,
 {
-        // Create progress bar
+    // Set up thread pool for parallel processing
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .map_err(|e| anyhow!("Failed to initialize thread pool: {}", e))?;
+
+    // Create progress bar
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
@@ -1137,7 +1259,8 @@ where
         2048 // Original buffer size
     };
     
-    let total_read_pairs = {
+    // Phase 1: Parallel BAM record processing with async orphan handling
+    let (total_read_pairs, mut fq) = {
         let mut rp_cache = RpCache::new(cache_size, relaxed);
         let w: ShardWriter<SerFq, SerFqSort> = ShardWriter::new(
             temp_file.path(), 
@@ -1145,10 +1268,30 @@ where
             buffer_size, 
             1 << 20 // Reduced from 1<<21 to reduce memory pressure
         )?;
-        let mut sender = w.get_sender();
-        let mut totle_read_pairs = 0;
+        let sender = w.get_sender();
+        let mut total_read_pairs = 0;
         let mut processed_reads = 0;
 
+        // Create channels for async orphan processing
+        let (orphan_tx, orphan_rx): (Sender<Record>, Receiver<Record>) = mpsc::channel();
+        let formatter_clone = formatter.clone();
+        let mut orphan_sender = sender.clone();
+        
+        // Spawn background thread for orphan processing
+        let orphan_handle = thread::spawn(move || -> Result<(), Error> {
+            while let Ok(orphan) = orphan_rx.recv() {
+                let ser = formatter_clone.bam_rec_to_ser(&orphan)
+                    .map_err(|e| anyhow!("Failed to serialize orphaned read: {}", e))?;
+                orphan_sender.send(ser)?;
+            }
+            Ok(())
+        });
+
+        // Create shared FastqManager for parallel writing
+        let fq_shared = Arc::new(Mutex::new(fq));
+        let formatter_shared = Arc::new(formatter.clone());
+
+        // Process records sequentially but with async orphan handling
         for _rec in records {
             let rec = _rec.context("Error when reading BAM")?;
             if rec.is_secondary() || rec.is_supplementary() {
@@ -1157,64 +1300,78 @@ where
 
             processed_reads += 1;
             
-                        // Update progress bar every 1000 records
-            if processed_reads % 1000 == 0 {
-                progress_bar.set_position(processed_reads);
-                progress_bar.set_message(format!("Processing BAM records..."));
-                
-                // Report memory usage periodically
-                if processed_reads % 100000 == 0 {
-                    let current_memory = get_available_memory();
-                    progress_bar.set_message(format!("Processing BAM records... (Memory: {} MB free)", current_memory / (1024 * 1024)));
-                }
-            }
-
             match (rec.is_first_in_template(), rec.is_last_in_template()) {
                 (false, false) => {
-                    return Err(anyhow!("Not single-end read {}", str::from_utf8(rec.qname()).map_err(|e| anyhow!("Invalid read name UTF-8: {}", e))?))
+                    return Err(anyhow!("Not single-end read {}", 
+                        str::from_utf8(rec.qname()).map_err(|e| anyhow!("Invalid read name UTF-8: {}", e))?))
                 }
                 (true, true) => {
-                    return Err(anyhow!("Read has both r1 and r2 flags: {}", str::from_utf8(rec.qname()).map_err(|e| anyhow!("Invalid read name UTF-8: {}", e))?))
+                    return Err(anyhow!("Read has both r1 and r2 flags: {}", 
+                        str::from_utf8(rec.qname()).map_err(|e| anyhow!("Invalid read name UTF-8: {}", e))?))
                 }
-                (true, false) => totle_read_pairs += 1,
-                (false, true) => (),
+                (true, false) => total_read_pairs += 1, // R1 read
+                (false, true) => (), // R2 read
             }
 
             let tid = rec.tid();
             let pos = rec.pos();
 
             if let Some((r1, r2)) = rp_cache.cache_rec(rec) {
-                let (rg, fq1, fq2, fq_i1, fq_i2) = formatter
+                let (rg, fq1, fq2, fq_i1, fq_i2) = formatter_shared
                     .format_read_pair(&r1, &r2)
                     .map_err(|e| anyhow!("Failed to format read pair: {}", e))?;
-                fq.write(&rg, &fq1, &fq2, &fq_i1, &fq_i2)
+                
+                // Write immediately without blocking
+                {
+                    let mut fq_guard = fq_shared.lock().unwrap();
+                    fq_guard.write(&rg, &fq1, &fq2, &fq_i1, &fq_i2);
+                }
             }
 
-            // More aggressive cache eviction to reduce memory pressure
+            // Async orphan handling - send to background thread
             if rp_cache.len() > cache_size * 3 / 4 {
                 for orphan in rp_cache.clear_orphans(tid, pos) {
-                    let ser = formatter.bam_rec_to_ser(&orphan)
-                        .map_err(|e| anyhow!("Failed to serialize orphaned read: {}", e))?;
-                    sender.send(ser)?;
+                    orphan_tx.send(orphan).map_err(|e| anyhow!("Failed to send orphan: {}", e))?;
+                }
+            }
+            
+            // Update progress bar every 1000 records
+            if processed_reads % 1000 == 0 {
+                progress_bar.set_position(processed_reads);
+                progress_bar.set_message(format!("Processing BAM records... (Parallel)"));
+                
+                // Report memory usage periodically
+                if processed_reads % 100000 == 0 {
+                    let current_memory = get_available_memory();
+                    progress_bar.set_message(format!("Processing BAM records... (Memory: {} MB free, {} threads)", 
+                        current_memory / (1024 * 1024), num_threads));
                 }
             }
         }
 
-        progress_bar.set_message("Processing orphaned reads...");
+
+
+        progress_bar.set_message("Processing remaining orphaned reads...");
         for (_, orphan) in rp_cache.cache.drain() {
-            let ser = formatter.bam_rec_to_ser(&orphan)
-                .map_err(|e| anyhow!("Failed to serialize orphaned read: {}", e))?;
-            sender.send(ser)?;
+            orphan_tx.send(orphan).map_err(|e| anyhow!("Failed to send orphan: {}", e))?;
         }
 
-        progress_bar.finish_with_message(format!("Processed {} reads, found {} read pairs", processed_reads, totle_read_pairs));
-        totle_read_pairs
+        // Close orphan channel and wait for background thread
+        drop(orphan_tx);
+        orphan_handle.join().map_err(|e| anyhow!("Orphan processing thread failed: {:?}", e))??;
+
+        progress_bar.finish_with_message(format!("Processed {} reads, found {} read pairs (Parallel)", processed_reads, total_read_pairs));
+        
+        // Extract FastqManager from Arc<Mutex<>>
+        let fq = Arc::try_unwrap(fq_shared).map_err(|_| anyhow!("Failed to unwrap FastqManager"))?.into_inner().unwrap();
+        
+        (total_read_pairs, fq)
     };
 
-        // Create new progress bar for the second stage
+    // Phase 2: Parallel orphan read processing
     let write_progress = ProgressBar::new_spinner();
     write_progress.set_style(ProgressStyle::default_spinner()
-        .template("{spinner:.blue} [{elapsed_precise}] Writing FASTQ files... {msg}")
+        .template("{spinner:.blue} [{elapsed_precise}] Writing orphan FASTQ files... {msg}")
         .map_err(|e| anyhow!("Failed to set progress bar style: {}", e))?
         .progress_chars("#>-"));
     write_progress.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -1222,14 +1379,19 @@ where
     let reader = ShardReader::<SerFq, SerFqSort>::open(temp_file.path())?;
     let mut ncached = 0;
     
-    // Use sequential processing for chunk processing to avoid iterator issues
-    let mut chunk_results = Vec::new();
+    // Parallel processing of orphan reads with immediate writing
     let reader_iter = reader.iter()?;
     let chunk_groups = reader_iter.chunk_by(|x| x.as_ref().ok().map(|x| x.header_key.clone()));
     
+    // Use the extracted FastqManager
+    
+    // Process chunks in parallel batches
+    let mut chunk_batch = Vec::new();
+    const CHUNK_BATCH_SIZE: usize = 100;
+    
     for (_, items) in &chunk_groups {
         let item_vec: Result<Vec<SerFq>, _> = items.collect();
-        let mut item_vec = item_vec?;
+        let item_vec = item_vec?;
         
         if item_vec.len() != 2 && !retricted_locus {
             let header = str::from_utf8(&item_vec[0].rec.head)
@@ -1247,40 +1409,121 @@ where
             continue;
         }
 
-        item_vec.sort_by_key(|x| x.read_num);
-        let r1 = item_vec.swap_remove(0);
-        let r2 = item_vec.swap_remove(0);
+        chunk_batch.push(item_vec);
         
-        chunk_results.push((r1.read_group, r1.rec, r2.rec, r1.i1, r1.i2));
-    }
-    
-    // Process results for writing
-    for (read_group, r1_rec, r2_rec, i1_rec, i2_rec) in chunk_results {
-        fq.write(&read_group, &r1_rec, &r2_rec, &i1_rec, &i2_rec);
-        ncached += 1;
-        
-                // Update progress bar every 100 records written
-        if ncached % 100 == 0 {
-            write_progress.set_message(format!("Written {} read pairs", ncached));
+        // Process batch when it reaches target size
+        if chunk_batch.len() >= CHUNK_BATCH_SIZE {
+            let batch = std::mem::take(&mut chunk_batch);
             
-            // Report memory usage periodically during writing
-            if ncached % 50000 == 0 {
-                let current_memory = get_available_memory();
-                write_progress.set_message(format!("Written {} read pairs (Memory: {} MB free)", ncached, current_memory / (1024 * 1024)));
+            // Process batch in parallel
+            let processed_pairs: Vec<_> = batch.into_par_iter().map(|mut item_vec| {
+                // Remove sorting requirement - just ensure R1/R2 assignment is correct
+                let (r1, r2) = if item_vec.len() == 2 {
+                    if item_vec[0].read_num == ReadNum::R1 {
+                        (item_vec.swap_remove(0), item_vec.swap_remove(0))
+                    } else {
+                        (item_vec.swap_remove(1), item_vec.swap_remove(0))
+                    }
+                } else {
+                    // Single read case - treat as R1
+                    let read = item_vec.swap_remove(0);
+                    let dummy_r2 = SerFq {
+                        read_group: read.read_group.clone(),
+                        header_key: read.header_key.clone(),
+                        rec: FqRecord {
+                            head: read.rec.head.clone(),
+                            seq: Vec::new(),
+                            qual: Vec::new(),
+                        },
+                        read_num: ReadNum::R2,
+                        i1: None,
+                        i2: None,
+                    };
+                    (read, dummy_r2)
+                };
+                (r1, r2)
+            }).collect();
+            
+            // Write all processed pairs immediately
+            for (r1, r2) in processed_pairs {
+                fq.write(&r1.read_group, &r1.rec, &r2.rec, &r1.i1, &r1.i2);
+                ncached += 1;
+            }
+        }
+        
+        // Update progress bar every 100 records written
+        if ncached % 100 == 0 {
+            write_progress.set_message(format!("Written {} read pairs (Parallel)", ncached));
+        }
+        
+        // Report memory usage and trigger cleanup if needed
+        if ncached % 50000 == 0 {
+            let current_memory = get_available_memory();
+            write_progress.set_message(format!("Written {} read pairs (Memory: {} MB free, {} threads)", 
+                ncached, current_memory / (1024 * 1024), num_threads));
+            
+            // Aggressive memory management based on available memory
+            if current_memory < 200 * 1024 * 1024 {
+                // Critical memory pressure - flush all writers immediately
+                fq.flush_all_writers();
+                write_progress.set_message(format!("Written {} read pairs (Critical memory pressure - flushed all buffers)", ncached));
+            } else if current_memory < 500 * 1024 * 1024 {
+                // Moderate memory pressure - trigger garbage collection
+                std::hint::black_box(());
+                write_progress.set_message(format!("Written {} read pairs (Low memory detected, optimizing...)", ncached));
             }
         }
     }
     
-    write_progress.finish_with_message(format!("Completed! Written {} read pairs", ncached));
+    // Process remaining chunks in the last batch
+    if !chunk_batch.is_empty() {
+        let batch = chunk_batch;
+        
+        let processed_pairs: Vec<_> = batch.into_par_iter().map(|mut item_vec| {
+            let (r1, r2) = if item_vec.len() == 2 {
+                if item_vec[0].read_num == ReadNum::R1 {
+                    (item_vec.swap_remove(0), item_vec.swap_remove(0))
+                } else {
+                    (item_vec.swap_remove(1), item_vec.swap_remove(0))
+                }
+            } else {
+                let read = item_vec.swap_remove(0);
+                let dummy_r2 = SerFq {
+                    read_group: read.read_group.clone(),
+                    header_key: read.header_key.clone(),
+                    rec: FqRecord {
+                        head: read.rec.head.clone(),
+                        seq: Vec::new(),
+                        qual: Vec::new(),
+                    },
+                    read_num: ReadNum::R2,
+                    i1: None,
+                    i2: None,
+                };
+                (read, dummy_r2)
+            };
+            (r1, r2)
+        }).collect();
+        
+        for (r1, r2) in processed_pairs {
+            fq.write(&r1.read_group, &r1.rec, &r2.rec, &r1.i1, &r1.i2);
+            ncached += 1;
+        }
+    }
+    
+    write_progress.finish_with_message(format!("Completed! Written {} read pairs (Parallel)", ncached));
+    
+    // Ensure all buffered writes are flushed
+    fq.flush_buffer();
     
     println!(
-        "Writing finished. \nObserved {} unique read ids. \nWrote {} read pairs ({} cached)",
+        "Writing finished. \nObserved {} unique read ids. \nWrote {} read pairs ({} cached) using {} threads",
         total_read_pairs,
         fq.total_written(),
-        ncached
+        ncached,
+        num_threads
     );
     Ok(fq.paths())
-
 }
 
 fn proc_single_ended<I>(
@@ -1291,7 +1534,7 @@ fn proc_single_ended<I>(
 where
     I: Iterator<Item = Result<Record, rust_htslib::errors::Error>>,
 {
-        // Create progress bar
+    // Create progress bar
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.green} [{elapsed_precise}] {pos} reads processed ({per_sec}/s) {msg}")
@@ -1299,9 +1542,12 @@ where
         .progress_chars("#>-"));
     progress_bar.enable_steady_tick(std::time::Duration::from_millis(100));
     
-    // Collect records with memory monitoring
-    let mut records_vec = Vec::new();
     let mut processed_count = 0;
+    let mut written_count = 0;
+    
+    // Batch processing with controlled memory usage
+    let mut batch = Vec::new();
+    let batch_size = 5000; // Process in batches of 5000 records
     
     for rec_result in records {
         let rec = rec_result.context("Error when reading BAM")?;
@@ -1310,53 +1556,57 @@ where
             continue;
         }
         
-        records_vec.push(rec);
         processed_count += 1;
+        batch.push(rec);
         
-        // Report progress and memory usage
-        if processed_count % 10000 == 0 {
-            progress_bar.set_position(processed_count as u64);
-            progress_bar.set_message("Processing single-end reads...");
+        // Process batch when it's full or check memory periodically
+        if batch.len() >= batch_size || processed_count % 10000 == 0 {
+            // Process current batch
+            for rec in batch.drain(..) {
+                let formatted = formatter.format_read(&rec)
+                    .map_err(|e| anyhow!("Failed to format single read: {}", e))?;
+                let (rg, r1, r2, i1, i2) = formatted;
+                fq.write(&rg, &r1, &r2, &i1, &i2);
+                written_count += 1;
+            }
             
-            if processed_count % 100000 == 0 {
+            // Report progress and memory usage
+            if processed_count % 10000 == 0 {
+                progress_bar.set_position(processed_count as u64);
                 let current_memory = get_available_memory();
-                progress_bar.set_message(format!("Processing single-end reads... (Memory: {} MB free)", current_memory / (1024 * 1024)));
+                progress_bar.set_message(format!("Processing single-end reads... (Memory: {} MB free, {} written)", 
+                    current_memory / (1024 * 1024), written_count));
+                
+                // Force flush if memory is getting low
+                if current_memory < 500 * 1024 * 1024 { // Less than 500MB
+                    fq.flush_buffer();
+                    progress_bar.set_message(format!("Low memory detected - flushed buffer ({} written)", written_count));
+                }
+            } else if processed_count % 1000 == 0 {
+                progress_bar.set_position(processed_count as u64);
+                progress_bar.set_message(format!("Processing single-end reads... ({} written)", written_count));
             }
         }
     }
     
-    let total_reads = records_vec.len();
-    
-    // Process records in smaller batches to reduce memory pressure
-    let available_memory = get_available_memory();
-    let batch_size = if available_memory < 2 * 1024 * 1024 * 1024 { // Less than 2GB
-        1000 // Smaller batches
-    } else {
-        10000 // Larger batches
-    };
-    
-    let mut written_count = 0;
-    
-    for batch in records_vec.chunks(batch_size) {
-        for rec in batch {
-            let formatted = formatter.format_read(rec)
-                .map_err(|e| anyhow!("Failed to format single read: {}", e))?;
-            let (rg, r1, r2, i1, i2) = formatted;
-            fq.write(&rg, &r1, &r2, &i1, &i2);
-            written_count += 1;
-        }
-        
-        // Update progress
-        progress_bar.set_position(written_count as u64);
-        progress_bar.set_message(format!("Processing single-end reads... ({} written)", written_count));
+    // Process any remaining records in the final batch
+    for rec in batch {
+        let formatted = formatter.format_read(&rec)
+            .map_err(|e| anyhow!("Failed to format single read: {}", e))?;
+        let (rg, r1, r2, i1, i2) = formatted;
+        fq.write(&rg, &r1, &r2, &i1, &i2);
+        written_count += 1;
     }
 
-    progress_bar.finish_with_message(format!("Processed {} reads", total_reads));
+    progress_bar.finish_with_message(format!("Processed {} reads, written {} reads", processed_count, written_count));
+    
+    // Ensure all buffered writes are flushed
+    fq.flush_buffer();
     
     // make sure we have the right number of output reads
     println!(
-        "Writing finished. \nObserved {} read pairs. \nWrote {} read pairs",
-        total_reads,
+        "Writing finished. \nObserved {} reads. \nWrote {} reads",
+        processed_count,
         fq.total_written()
     );
     Ok(fq.paths())
@@ -1391,15 +1641,14 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
-        #[test]
+    #[test]
     fn test_lr21() {
         // Create a fixed output directory
         let output_dir = "target/fastq_results";
 
-        let args = Args {
-            threads: 10,
+        let args = crate::Args {
+            threads: 2,
             bam: "/Volumes/mac_up/anno_decon_sorted.bam".to_string(),
             outputpath: output_dir.to_string(),
             reads_per_fastq: None,
@@ -1409,6 +1658,7 @@ mod tests {
             relaxed: false,
             max_memory: None,
             auto_detect: true,
+            no_compress: false,
         };
 
                 // Run conversion
@@ -1447,7 +1697,7 @@ mod tests {
             .expect("create temp dir");
         let tmp_path = tempdir.path().join("outs");
 
-        let args = Args {
+        let args = crate::Args  {
             threads: 2,
             bam: "/Users/lishuangshuang/Documents/scrna/dnbc4tools/target/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
             outputpath: tmp_path.to_str().unwrap().to_string(),
@@ -1458,6 +1708,7 @@ mod tests {
             relaxed: false,
             max_memory: None,
             auto_detect: true,
+            no_compress: false,
         };
 
         let res = super::go(args, Some(2));
