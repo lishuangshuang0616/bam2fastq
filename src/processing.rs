@@ -145,12 +145,6 @@ where
     I: Iterator<Item = Result<Record, E>>,
     Result<Record, E>: Context<Record, E>,
 {
-    // Thread pool for parallel processing
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-        .map_err(|e| anyhow!("Failed to initialize thread pool: {}", e))?;
-
     let progress_bar = ProgressBar::new_spinner();
     progress_bar.set_style(
         ProgressStyle::default_spinner()

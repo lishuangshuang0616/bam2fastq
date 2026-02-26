@@ -290,58 +290,105 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_lr21() {
-        let output_dir = "target/fastq_results";
-        let args = crate::Args {
-            threads: 2,
-            bam: "/Volumes/mac_up/anno_decon_sorted.bam".to_string(),
-            outputpath: output_dir.to_string(),
-            reads_per_fastq: None,
-            locus: None,
-            bx_list: None,
-            traceback: false,
-            relaxed: false,
-            max_memory: None,
-            auto_detect: true,
-            no_compress: true,
-        };
-        let out_path_sets = super::go(args, None).unwrap();
-        println!("\nGenerated FASTQ files:");
-        for (r1, r2, i1, i2) in out_path_sets {
-            println!("R1: {}", r1.display());
-            println!("R2: {}", r2.display());
-            if let Some(p) = i1 {
-                println!("I1: {}", p.display());
-            }
-            if let Some(p) = i2 {
-                println!("I2: {}", p.display());
-            }
-            println!("---");
+    use rust_htslib::bam::{self, header::Header, Format, Writer};
+    use tempfile::Builder;
+
+    fn create_test_bam(path: &std::path::Path, is_paired: bool) {
+        let header = Header::new();
+        let mut writer = Writer::from_path(path, &header, Format::Bam).unwrap();
+
+        let mut rec1 = bam::Record::new();
+        // A single-ended read or first in pair
+        rec1.set(b"read1", None, b"ACGT", b"++++");
+        let _ = rec1.push_aux(b"CR", bam::record::Aux::String("AGAG"));
+        let _ = rec1.push_aux(b"CY", bam::record::Aux::String("++++"));
+        let _ = rec1.push_aux(b"UR", bam::record::Aux::String("TCGA"));
+        let _ = rec1.push_aux(b"UY", bam::record::Aux::String("++++"));
+        let _ = rec1.push_aux(b"CB", bam::record::Aux::String("AGAG-1"));
+        let mut flags: u16 = 4; // UNMAPPED
+        if is_paired {
+            flags |= 1 | 64; // PAIRED | READ_1
+        }
+        rec1.set_flags(flags);
+        writer.write(&rec1).unwrap();
+
+        if is_paired {
+            let mut rec2 = bam::Record::new();
+            rec2.set(b"read1", None, b"TGCA", b"++++");
+            let flags2: u16 = 4 | 1 | 128; // UNMAPPED | PAIRED | READ_2
+            rec2.set_flags(flags2);
+            writer.write(&rec2).unwrap();
         }
     }
 
     #[test]
-    fn bad_bam() {
-        let tempdir = tempfile::Builder::new()
-            .prefix("bam_to_fq_test")
+    fn test_single_end_conversion() {
+        let tempdir = Builder::new()
+            .prefix("bam_to_fq_se_test")
             .tempdir()
             .expect("create temp dir");
-        let tmp_path = tempdir.path().join("outs");
+        let bam_path = tempdir.path().join("test_se.bam");
+        create_test_bam(&bam_path, false);
+
+        let out_dir = tempdir.path().join("outs");
         let args = crate::Args {
             threads: 2,
-            bam: "/my_test_3/pos_sortednon_multiplexed.bam".to_string(),
-            outputpath: tmp_path.to_str().unwrap().to_string(),
+            bam: bam_path.to_str().unwrap().to_string(),
+            outputpath: out_dir.to_str().unwrap().to_string(),
             reads_per_fastq: None,
             locus: None,
             bx_list: None,
-            traceback: false,
-            relaxed: false,
+            traceback: true,
+            relaxed: true,
             max_memory: None,
             auto_detect: true,
-            no_compress: false,
+            no_compress: true,
         };
-        let res = super::go(args, Some(2));
-        println!("res: {:?}", res);
+
+        let result = super::go(args, Some(2));
+        assert!(
+            result.is_ok(),
+            "Single-end BAM conversion failed: {:?}",
+            result.err()
+        );
+
+        // Assert output format
+        let out_path_sets = result.unwrap();
+        assert_eq!(out_path_sets.len(), 1);
+    }
+
+    #[test]
+    fn test_paired_end_conversion() {
+        let tempdir = Builder::new()
+            .prefix("bam_to_fq_pe_test")
+            .tempdir()
+            .expect("create temp dir");
+        let bam_path = tempdir.path().join("test_pe.bam");
+        create_test_bam(&bam_path, true);
+
+        let out_dir = tempdir.path().join("outs");
+        let args = crate::Args {
+            threads: 2,
+            bam: bam_path.to_str().unwrap().to_string(),
+            outputpath: out_dir.to_str().unwrap().to_string(),
+            reads_per_fastq: None,
+            locus: None,
+            bx_list: None,
+            traceback: true,
+            relaxed: true,
+            max_memory: None,
+            auto_detect: true,
+            no_compress: true,
+        };
+
+        let result = super::go(args, Some(2));
+        assert!(
+            result.is_ok(),
+            "Paired-end BAM conversion failed: {:?}",
+            result.err()
+        );
+
+        let out_path_sets = result.unwrap();
+        assert_eq!(out_path_sets.len(), 1);
     }
 }
