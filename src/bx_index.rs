@@ -1,4 +1,3 @@
-
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::result;
@@ -157,7 +156,3 @@ impl<R: Read> Iterator for BxListIter<R> {
         None
     }
 }
-
-
-
-
